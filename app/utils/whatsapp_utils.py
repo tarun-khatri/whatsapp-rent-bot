@@ -71,8 +71,16 @@ async def process_whatsapp_message(body):
             media_id = media_url.replace("media_id:", "")
             try:
                 media_data = await whatsapp_service.download_media(media_id)
+                logger.info("Media downloaded successfully", media_id=media_id, size=len(media_data) if media_data else 0)
             except Exception as e:
                 logger.error("Failed to download media", media_id=media_id, error=str(e))
+                # Send error message to user about media download failure
+                try:
+                    error_message = "מצטער, לא הצלחתי להוריד את הקובץ. אנא נסה לשלוח שוב או פנה לצוות התמיכה."
+                    await whatsapp_service.send_text_message(wa_id, error_message)
+                    return
+                except Exception as send_error:
+                    logger.error("Failed to send media download error message", error=str(send_error))
 
         # Handle the message through conversation flow
         response_message = await conversation_flow_service.handle_incoming_message(
@@ -82,22 +90,23 @@ async def process_whatsapp_message(body):
             media_data=media_data
         )
 
-        # Send response back to user
-        try:
-            await whatsapp_service.send_text_message(wa_id, response_message)
-            logger.info("WhatsApp message processed successfully", wa_id=wa_id)
-        except WhatsAppAPIError as api_error:
-            logger.error("WhatsApp API error - cannot send message", wa_id=wa_id, error=str(api_error))
-            # Don't try to send error message if API is failing
-            return
-        except Exception as send_error:
-            logger.error("Error sending WhatsApp message", wa_id=wa_id, error=str(send_error))
-            # Try to send error message
+        # Send response back to user (only if there's a response message)
+        if response_message and response_message.strip():
             try:
-                error_message = "מצטער, אירעה שגיאה. אנא נסה שוב או פנה לצוות התמיכה."
-                await whatsapp_service.send_text_message(wa_id, error_message)
-            except Exception as final_error:
-                logger.error("Failed to send error message", error=final_error)
+                await whatsapp_service.send_text_message(wa_id, response_message)
+                logger.info("WhatsApp message processed successfully", wa_id=wa_id)
+            except WhatsAppAPIError as api_error:
+                logger.error("WhatsApp API error - cannot send message", wa_id=wa_id, error=str(api_error))
+                # Don't try to send error message if API is failing
+                return
+            except Exception as send_error:
+                logger.error("Error sending WhatsApp message", wa_id=wa_id, error=str(send_error))
+                # Try to send error message
+                try:
+                    error_message = "מצטער, אירעה שגיאה. אנא נסה שוב או פנה לצוות התמיכה."
+                    await whatsapp_service.send_text_message(wa_id, error_message)
+                except Exception as final_error:
+                    logger.error("Failed to send error message", error=final_error)
 
     except Exception as e:
         logger.error("Error processing WhatsApp message", error=str(e))

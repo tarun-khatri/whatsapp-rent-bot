@@ -15,6 +15,7 @@ from ..services.vertex_ai_service import vertex_ai_service
 from ..services.document_ai_service import document_ai_service
 from ..services.guarantor_service import guarantor_service
 from ..services.guarantor_conversation_service import guarantor_conversation_service
+from ..services.ai_conversation_service import ai_conversation_service
 from ..utils.phone_utils import normalize_phone_number, extract_phone_from_whatsapp_id
 
 logger = structlog.get_logger(__name__)
@@ -56,11 +57,8 @@ class ConversationFlowService:
         guarantor = await guarantor_service.get_guarantor_by_phone(phone_number)
         
         if guarantor:
-            # Handle guarantor message
-            result = await guarantor_conversation_service.process_guarantor_message(
-                phone_number, message_type, media_data
-            )
-            return result.get("message", "Message processed")
+            # Handle guarantor message with AI
+            return await self._handle_guarantor_with_ai(phone_number, message_body, message_type, media_data)
         
         # Continue with regular tenant flow
         self._ensure_initialized()
@@ -80,19 +78,19 @@ class ConversationFlowService:
 
             # Handle based on current state
             if conversation_state.current_state == ConversationState.GREETING:
-                return await self._handle_greeting_state(phone, message_body, conversation_state)
+                return await self._handle_greeting_state_with_ai(phone, message_body, conversation_state)
             elif conversation_state.current_state == ConversationState.CONFIRMATION:
-                return await self._handle_confirmation_state(phone, message_body, conversation_state)
+                return await self._handle_confirmation_state_with_ai(phone, message_body, conversation_state)
             elif conversation_state.current_state == ConversationState.PERSONAL_INFO:
-                return await self._handle_personal_info_state(phone, message_body, conversation_state)
+                return await self._handle_personal_info_state_with_ai(phone, message_body, conversation_state)
             elif conversation_state.current_state == ConversationState.DOCUMENTS:
-                return await self._handle_documents_state(phone, message_body, message_type, media_data, conversation_state)
+                return await self._handle_documents_state_with_ai(phone, message_body, message_type, media_data, conversation_state)
             elif conversation_state.current_state == ConversationState.GUARANTOR_1:
-                return await self._handle_guarantor_state(phone, message_body, conversation_state, 1)
+                return await self._handle_guarantor_state_with_ai(phone, message_body, conversation_state, 1)
             elif conversation_state.current_state == ConversationState.GUARANTOR_2:
-                return await self._handle_guarantor_state(phone, message_body, conversation_state, 2)
+                return await self._handle_guarantor_state_with_ai(phone, message_body, conversation_state, 2)
             elif conversation_state.current_state == ConversationState.COMPLETED:
-                return await self._handle_completed_state(phone, message_body, conversation_state)
+                return await self._handle_completed_state_with_ai(phone, message_body, conversation_state)
             else:
                 return "מצטער, אירעה שגיאה. אנא פנה לצוות התמיכה."
 
@@ -791,6 +789,272 @@ Return ONLY the JSON object."""
     async def _handle_completed_state(self, phone: str, message_body: str, conversation_state: ConversationStateModel) -> str:
         """Handle completed state - process is finished."""
         return "התהליך הושלם בהצלחה! תודה שהצטרפת למשפחת מגורית. אם יש לך שאלות נוספות, אנא פנה לצוות התמיכה."
+
+    # AI-Powered Handler Methods
+    async def _handle_guarantor_with_ai(self, phone_number: str, message_body: str, message_type: str, media_data: bytes = None) -> str:
+        """Handle guarantor message with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                phone_number, "guarantor", "user_message", message_body, "GUARANTOR_MESSAGE"
+            )
+            
+            # Get guarantor data first
+            from app.services.supabase_service import supabase_service
+            guarantor = await supabase_service.find_guarantor_by_phone(phone_number)
+            
+            # Process the message using existing logic
+            result = await guarantor_conversation_service.process_guarantor_message(
+                phone_number, message_type, media_data
+            )
+            
+            # Check if document processing was successful
+            if result.get("success") and result.get("message"):
+                logger.info("Document processing successful, letting AI handle confirmation", extra={
+                    "phone_number": phone_number,
+                    "result_message": result.get("message")
+                })
+                # Let the AI handle the confirmation message instead of pre-written message
+                # Continue to AI response generation
+            
+            # If document processing didn't return a direct message, generate AI response
+            logger.info("Document processing didn't return direct message, generating AI response", extra={
+                "phone_number": phone_number,
+                "result_success": result.get("success", False)
+            })
+            
+            # Get guarantor context data
+            guarantor_context = {}
+            if guarantor:
+                # Get tenant information for context
+                tenant = await supabase_service.get_tenant_by_id(guarantor.tenant_id)
+                if tenant:
+                    guarantor_context = {
+                        "guarantor_name": guarantor.full_name,
+                        "tenant_name": tenant.full_name,
+                        "property_name": tenant.property_name,
+                        "apartment_number": tenant.apartment_number
+                    }
+                
+                # Get current document from conversation state
+                conversation_state = await guarantor_service.get_guarantor_conversation_state(phone_number)
+                current_document = conversation_state.get("context_data", {}).get("current_document", "id_card")
+                guarantor_context["current_document"] = current_document
+                print(f"DEBUG: Current document for guarantor: {current_document}")
+            
+            # Add document approval/rejection status to context
+            if result.get("success") and result.get("message"):
+                guarantor_context["document_just_approved"] = True
+                # Extract next document from the result message
+                result_message = result.get("message", "")
+                if "next document" in result_message:
+                    # Extract the next document name from the message
+                    # Format: "Document id_card approved, next document sephach requested"
+                    parts = result_message.split("next document ")
+                    if len(parts) > 1:
+                        next_doc = parts[1].split(" ")[0]
+                        guarantor_context["next_document"] = next_doc
+                        print(f"DEBUG: Extracted next document: {next_doc}")
+                else:
+                    print(f"DEBUG: No 'next document' found in message: {result_message}")
+            elif not result.get("success") and result.get("message"):
+                # Document was rejected - pass rejection context to AI
+                guarantor_context["document_just_rejected"] = True
+                guarantor_context["rejection_reason"] = result.get("message", "Document validation failed")
+                print(f"DEBUG: Document rejected - {result.get('message', 'Unknown error')}")
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=phone_number,
+                user_message=message_body,
+                conversation_type="guarantor",
+                current_state="GUARANTOR_MESSAGE",
+                context_data=guarantor_context
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error("Error handling guarantor with AI", extra={
+                "phone_number": phone_number,
+                "error": str(e)
+            })
+            return "מצטער, אירעה שגיאה. אנא נסה שוב."
+
+    async def _handle_greeting_state_with_ai(self, phone: str, message_body: str, conversation_state: ConversationStateModel) -> str:
+        """Handle greeting state with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
+            )
+            
+            # Process using existing logic
+            response = await self._handle_greeting_state(phone, message_body, conversation_state)
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=phone,
+                user_message=message_body,
+                conversation_type="tenant",
+                current_state=conversation_state.current_state,
+                context_data=conversation_state.context_data
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error("Error handling greeting state with AI", extra={
+                "phone": phone,
+                "error": str(e)
+            })
+            return await self._handle_greeting_state(phone, message_body, conversation_state)
+
+    async def _handle_confirmation_state_with_ai(self, phone: str, message_body: str, conversation_state: ConversationStateModel) -> str:
+        """Handle confirmation state with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
+            )
+            
+            # Process using existing logic
+            response = await self._handle_confirmation_state(phone, message_body, conversation_state)
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=phone,
+                user_message=message_body,
+                conversation_type="tenant",
+                current_state=conversation_state.current_state,
+                context_data=conversation_state.context_data
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error("Error handling confirmation state with AI", extra={
+                "phone": phone,
+                "error": str(e)
+            })
+            return await self._handle_confirmation_state(phone, message_body, conversation_state)
+
+    async def _handle_personal_info_state_with_ai(self, phone: str, message_body: str, conversation_state: ConversationStateModel) -> str:
+        """Handle personal info state with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
+            )
+            
+            # Process using existing logic
+            response = await self._handle_personal_info_state(phone, message_body, conversation_state)
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=phone,
+                user_message=message_body,
+                conversation_type="tenant",
+                current_state=conversation_state.current_state,
+                context_data=conversation_state.context_data
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error("Error handling personal info state with AI", extra={
+                "phone": phone,
+                "error": str(e)
+            })
+            return await self._handle_personal_info_state(phone, message_body, conversation_state)
+
+    async def _handle_documents_state_with_ai(self, phone: str, message_body: str, message_type: str, media_data: bytes, conversation_state: ConversationStateModel) -> str:
+        """Handle documents state with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
+            )
+            
+            # Process using existing logic
+            response = await self._handle_documents_state(phone, message_body, message_type, media_data, conversation_state)
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=phone,
+                user_message=message_body,
+                conversation_type="tenant",
+                current_state=conversation_state.current_state,
+                context_data=conversation_state.context_data
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error("Error handling documents state with AI", extra={
+                "phone": phone,
+                "error": str(e)
+            })
+            return await self._handle_documents_state(phone, message_body, message_type, media_data, conversation_state)
+
+    async def _handle_guarantor_state_with_ai(self, phone: str, message_body: str, conversation_state: ConversationStateModel, guarantor_number: int) -> str:
+        """Handle guarantor state with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
+            )
+            
+            # Process using existing logic
+            response = await self._handle_guarantor_state(phone, message_body, conversation_state, guarantor_number)
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=phone,
+                user_message=message_body,
+                conversation_type="tenant",
+                current_state=conversation_state.current_state,
+                context_data=conversation_state.context_data
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error("Error handling guarantor state with AI", extra={
+                "phone": phone,
+                "guarantor_number": guarantor_number,
+                "error": str(e)
+            })
+            return await self._handle_guarantor_state(phone, message_body, conversation_state, guarantor_number)
+
+    async def _handle_completed_state_with_ai(self, phone: str, message_body: str, conversation_state: ConversationStateModel) -> str:
+        """Handle completed state with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
+            )
+            
+            # Process using existing logic
+            response = await self._handle_completed_state(phone, message_body, conversation_state)
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=phone,
+                user_message=message_body,
+                conversation_type="tenant",
+                current_state=conversation_state.current_state,
+                context_data=conversation_state.context_data
+            )
+            
+            return ai_response
+            
+        except Exception as e:
+            logger.error("Error handling completed state with AI", extra={
+                "phone": phone,
+                "error": str(e)
+            })
+            return await self._handle_completed_state(phone, message_body, conversation_state)
 
 
 # Global instance

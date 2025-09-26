@@ -16,6 +16,7 @@ from app.services.guarantor_service import guarantor_service
 from app.services.document_ai_service import document_ai_service
 from app.services.whatsapp_service import whatsapp_service
 from app.services.vertex_ai_service import vertex_ai_service
+from app.services.ai_conversation_service import ai_conversation_service
 from app.models.tenant import DocumentType
 
 logger = logging.getLogger(__name__)
@@ -58,27 +59,38 @@ class GuarantorConversationService:
                 "guarantor_number": guarantor["guarantor_number"]
             })
             
-            # Route to appropriate handler
+            # Route to appropriate handler with AI responses
+            logger.info("Routing to handler", extra={
+                "current_state": current_state,
+                "message_type": message_type,
+                "guarantor_id": guarantor["id"]
+            })
+            
             if current_state == "GREETING":
                 # If it's the first message from guarantor, send greeting and move to documents
                 if message_type == "text" and content and any(word in content.lower() for word in ["שלום", "היי", "hello", "hi"]):
-                    return await self._handle_guarantor_greeting(guarantor, message_type, content)
+                    logger.info("Handling greeting with AI - greeting detected", extra={"guarantor_id": guarantor["id"]})
+                    return await self._handle_guarantor_greeting_with_ai(guarantor, message_type, content)
                 else:
                     # Send greeting message and move to documents state
-                    return await self._handle_guarantor_greeting(guarantor, message_type, content)
+                    logger.info("Handling greeting with AI - default greeting", extra={"guarantor_id": guarantor["id"]})
+                    return await self._handle_guarantor_greeting_with_ai(guarantor, message_type, content)
             elif current_state == "PERSONAL_INFO":
-                return await self._handle_guarantor_personal_info(guarantor, message_type, content)
+                logger.info("Handling personal info with AI", extra={"guarantor_id": guarantor["id"]})
+                return await self._handle_guarantor_personal_info_with_ai(guarantor, message_type, content)
             elif current_state == "DOCUMENTS":
-                return await self._handle_guarantor_documents(guarantor, message_type, content)
+                logger.info("Handling documents with AI", extra={"guarantor_id": guarantor["id"]})
+                return await self._handle_guarantor_documents_with_ai(guarantor, message_type, content)
             elif current_state == "COMPLETED":
-                return await self._handle_guarantor_completed(guarantor, message_type, content)
+                logger.info("Handling completed with AI", extra={"guarantor_id": guarantor["id"]})
+                return await self._handle_guarantor_completed_with_ai(guarantor, message_type, content)
             else:
                 # Default to documents state for any unknown state (since guarantors should be in documents state)
                 logger.info("Unknown state, defaulting to documents", extra={
                     "current_state": current_state,
                     "guarantor_id": guarantor["id"]
                 })
-                return await self._handle_guarantor_documents(guarantor, message_type, content)
+                return await self._handle_guarantor_documents_with_ai(guarantor, message_type, content)
                 
         except Exception as e:
             logger.error("Error processing guarantor message", extra={"error": str(e)})
@@ -240,6 +252,12 @@ class GuarantorConversationService:
                 })
                 
                 if result.get("validation_result", {}).get("is_valid", False):
+                    logger.info("Document validation successful", extra={
+                        "guarantor_id": guarantor["id"],
+                        "current_document": current_document,
+                        "file_url": result.get("file_url")
+                    })
+                    
                     # Update documents status
                     await self.guarantor_service.update_guarantor_documents_status(
                         guarantor["id"],
@@ -250,6 +268,11 @@ class GuarantorConversationService:
                     
                     # Get next document
                     next_document = await self._get_next_guarantor_document(current_document)
+                    logger.info("Next document determined", extra={
+                        "guarantor_id": guarantor["id"],
+                        "current_document": current_document,
+                        "next_document": next_document
+                    })
                     
                     if next_document:
                         # Update conversation state with next document
@@ -263,16 +286,43 @@ class GuarantorConversationService:
                             }
                         )
                         
-                        # Send next document request
-                        next_message = await self._get_guarantor_document_request_message(next_document)
+                        # Send confirmation message for approved document
+                        document_name_map = {
+                            "id_card": "תעודת הזהות",
+                            "sephach": "הספח",
+                            "payslips": "תלושי המשכורת",
+                            "bank_statements": "דוח הבנק",
+                            "pnl": "דוח רווח והפסד"
+                        }
+                        
+                        approved_document_name = document_name_map.get(current_document, current_document)
+                        next_document_name = document_name_map.get(next_document, next_document)
+                        
+                        # Don't send pre-written confirmation message
+                        # Let the AI handle the confirmation and next document request
+                        logger.info("Document approved, letting AI handle confirmation", extra={
+                            "guarantor_id": guarantor["id"],
+                            "approved_document": current_document,
+                            "next_document": next_document
+                        })
                         
                         return {
                             "success": True,
-                            "message": f"מעולה! {current_document} התקבל ואושר. {next_message}"
+                            "message": f"Document {current_document} approved, next document {next_document} requested"
                         }
                     else:
-                        # All documents collected
-                        await self._send_guarantor_completion_message(guarantor)
+                        # All documents collected - send completion message
+                        document_name_map = {
+                            "id_card": "תעודת הזהות",
+                            "sephach": "הספח",
+                            "payslips": "תלושי המשכורת",
+                            "bank_statements": "דוח הבנק",
+                            "pnl": "דוח רווח והפסד"
+                        }
+                        
+                        approved_document_name = document_name_map.get(current_document, current_document)
+                        completion_message = f"מעולה! {approved_document_name} התקבל ואושר. כל המסמכים הושלמו בהצלחה!"
+                        await self.whatsapp_service.send_text_message(guarantor["phone_number"], completion_message)
                         
                         # Update conversation state
                         await self.guarantor_service.update_guarantor_conversation_state(
@@ -323,7 +373,8 @@ class GuarantorConversationService:
             "id_card",
             "sephach", 
             "payslips",
-            "bank_statements"
+            "bank_statements",
+            "pnl"
         ]
         
         try:
@@ -340,7 +391,8 @@ class GuarantorConversationService:
             "id_card": "אנא שלח את תעודת הזהות שלך.",
             "sephach": "אנא שלח את הספח (Sephach).",
             "payslips": "אנא שלח את 3 תלושי המשכורת האחרונים.",
-            "bank_statements": "אנא שלח את דוח הבנק של 3 החודשים האחרונים."
+            "bank_statements": "אנא שלח את דוח הבנק של 3 החודשים האחרונים.",
+            "pnl": "אנא שלח את דוח רווח והפסד (PNL) החתום על ידי רואה חשבון."
         }
         return messages.get(document_type, "אנא שלח את המסמך הבא.")
     
@@ -547,6 +599,244 @@ Return ONLY the document type."""
             
         except Exception as e:
             logger.error("Error checking guarantor completion", extra={"error": str(e)})
+
+    # AI-Powered Handler Methods
+    async def _handle_guarantor_greeting_with_ai(self, guarantor: Dict[str, Any], message_type: str, content: Any) -> Dict[str, Any]:
+        """Handle guarantor greeting with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                guarantor["phone_number"], "guarantor", "user_message", str(content), "GREETING"
+            )
+            
+            # Process using existing logic
+            result = await self._handle_guarantor_greeting(guarantor, message_type, content)
+            
+            # Get conversation state to retrieve stored context data
+            conversation_state = await self.guarantor_service.get_guarantor_conversation_state(guarantor["phone_number"])
+            stored_context = conversation_state.get("context_data", {}) if conversation_state else {}
+            
+            # Log the stored context data
+            logger.info("Stored context data from guarantor_conversation_states", extra={
+                "stored_context": stored_context,
+                "conversation_state": conversation_state
+            })
+            
+            # Get guarantor context data - start with stored context data
+            guarantor_context = {
+                "guarantor_name": guarantor["full_name"],
+                "tenant_name": stored_context.get("tenant_name", "הדייר"),
+                "property_name": stored_context.get("property_name", "הנכס"),
+                "current_document": stored_context.get("current_document", "המסמך")
+            }
+            
+            # Try to get tenant information for better context if not already stored
+            if not stored_context.get("tenant_name") or not stored_context.get("property_name"):
+                try:
+                    from app.services.supabase_service import supabase_service
+                    tenant = await supabase_service.get_tenant_by_id(guarantor["tenant_id"])
+                    if tenant:
+                        guarantor_context.update({
+                            "tenant_name": tenant.full_name,
+                            "property_name": tenant.property_name,
+                            "apartment_number": tenant.apartment_number
+                        })
+                except Exception as e:
+                    logger.warning("Could not get tenant context for guarantor", extra={"error": str(e)})
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=guarantor["phone_number"],
+                user_message=str(content),
+                conversation_type="guarantor",
+                current_state="GREETING",
+                context_data=guarantor_context
+            )
+            
+            return {
+                "success": True,
+                "message": ai_response
+            }
+            
+        except Exception as e:
+            logger.error("Error handling guarantor greeting with AI", extra={
+                "guarantor_id": guarantor["id"],
+                "error": str(e)
+            })
+            return await self._handle_guarantor_greeting(guarantor, message_type, content)
+
+    async def _handle_guarantor_personal_info_with_ai(self, guarantor: Dict[str, Any], message_type: str, content: Any) -> Dict[str, Any]:
+        """Handle guarantor personal info with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                guarantor["phone_number"], "guarantor", "user_message", str(content), "PERSONAL_INFO"
+            )
+            
+            # Process using existing logic
+            result = await self._handle_guarantor_personal_info(guarantor, message_type, content)
+            
+            # Get guarantor context data
+            guarantor_context = {
+                "guarantor_name": guarantor["full_name"],
+                "tenant_name": "הדייר",
+                "property_name": "הנכס"
+            }
+            
+            # Try to get tenant information for better context
+            try:
+                from app.services.supabase_service import supabase_service
+                tenant = await supabase_service.get_tenant_by_id(guarantor["tenant_id"])
+                if tenant:
+                    guarantor_context.update({
+                        "tenant_name": tenant.full_name,
+                        "property_name": tenant.property_name,
+                        "apartment_number": tenant.apartment_number
+                    })
+            except Exception as e:
+                logger.warning("Could not get tenant context for guarantor", extra={"error": str(e)})
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=guarantor["phone_number"],
+                user_message=str(content),
+                conversation_type="guarantor",
+                current_state="PERSONAL_INFO",
+                context_data=guarantor_context
+            )
+            
+            return {
+                "success": True,
+                "message": ai_response
+            }
+            
+        except Exception as e:
+            logger.error("Error handling guarantor personal info with AI", extra={
+                "guarantor_id": guarantor["id"],
+                "error": str(e)
+            })
+            return await self._handle_guarantor_personal_info(guarantor, message_type, content)
+
+    async def _handle_guarantor_documents_with_ai(self, guarantor: Dict[str, Any], message_type: str, content: Any) -> Dict[str, Any]:
+        """Handle guarantor documents with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                guarantor["phone_number"], "guarantor", "user_message", str(content), "DOCUMENTS"
+            )
+            
+            # Process using existing logic
+            result = await self._handle_guarantor_documents(guarantor, message_type, content)
+            
+            # Check if document validation passed
+            if not result.get("success", False):
+                # Document validation failed - return the error message directly
+                logger.info("Document validation failed, returning error message", extra={
+                    "guarantor_id": guarantor["id"],
+                    "error_message": result.get("message", "Unknown error")
+                })
+                return result
+            
+            # Document validation passed - return the result directly (no AI response needed)
+            logger.info("Document validation passed, returning result directly", extra={
+                "guarantor_id": guarantor["id"],
+                "result_message": result.get("message", "No message"),
+                "result_success": result.get("success", False)
+            })
+            return result
+            
+        except Exception as e:
+            logger.error("Error handling guarantor documents with AI", extra={
+                "guarantor_id": guarantor["id"],
+                "error": str(e)
+            })
+            return await self._handle_guarantor_documents(guarantor, message_type, content)
+
+    async def _handle_guarantor_completed_with_ai(self, guarantor: Dict[str, Any], message_type: str, content: Any) -> Dict[str, Any]:
+        """Handle guarantor completed with AI responses."""
+        try:
+            # Store user message in history
+            await ai_conversation_service._store_message_history(
+                guarantor["phone_number"], "guarantor", "user_message", str(content), "COMPLETED"
+            )
+            
+            # Process using existing logic
+            result = await self._handle_guarantor_completed(guarantor, message_type, content)
+            
+            # Get guarantor context data
+            guarantor_context = {
+                "guarantor_name": guarantor["full_name"],
+                "tenant_name": "הדייר",
+                "property_name": "הנכס"
+            }
+            
+            # Try to get tenant information for better context
+            try:
+                from app.services.supabase_service import supabase_service
+                tenant = await supabase_service.get_tenant_by_id(guarantor["tenant_id"])
+                if tenant:
+                    guarantor_context.update({
+                        "tenant_name": tenant.full_name,
+                        "property_name": tenant.property_name,
+                        "apartment_number": tenant.apartment_number
+                    })
+            except Exception as e:
+                logger.warning("Could not get tenant context for guarantor", extra={"error": str(e)})
+            
+            # Generate AI response
+            ai_response = await ai_conversation_service.generate_response(
+                phone_number=guarantor["phone_number"],
+                user_message=str(content),
+                conversation_type="guarantor",
+                current_state="COMPLETED",
+                context_data=guarantor_context
+            )
+            
+            return {
+                "success": True,
+                "message": ai_response
+            }
+            
+        except Exception as e:
+            logger.error("Error handling guarantor completed with AI", extra={
+                "guarantor_id": guarantor["id"],
+                "error": str(e)
+            })
+            return await self._handle_guarantor_completed(guarantor, message_type, content)
+    
+    async def _get_guarantor_document_status(self, guarantor_id: str) -> Dict[str, str]:
+        """Get current document status for a guarantor."""
+        try:
+            from app.services.supabase_service import supabase_service
+            
+            # Ensure supabase is initialized
+            supabase_service._ensure_initialized()
+            
+            # Get guarantor document status from the documents_status JSONB field
+            result = supabase_service.client.table("guarantors").select("documents_status").eq("id", guarantor_id).execute()
+            
+            if result.data:
+                guarantor_data = result.data[0]
+                documents_status = guarantor_data.get("documents_status", {})
+                
+                # Extract status for each document type
+                return {
+                    "id_card": documents_status.get("id_card", {}).get("status", "pending"),
+                    "sephach": documents_status.get("sephach", {}).get("status", "pending"),
+                    "payslips": documents_status.get("payslips", {}).get("status", "pending"),
+                    "bank_statements": documents_status.get("bank_statements", {}).get("status", "pending"),
+                    "pnl": documents_status.get("pnl", {}).get("status", "pending")
+                }
+            
+            return {}
+            
+        except Exception as e:
+            logger.error("Error getting guarantor document status", extra={
+                "guarantor_id": guarantor_id,
+                "error": str(e),
+                "error_type": type(e).__name__
+            })
+            return {}
 
 
 # Global instance

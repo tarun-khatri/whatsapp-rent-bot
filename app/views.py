@@ -40,6 +40,56 @@ def handle_message():
         .get("statuses")
     ):
         logger.info("Received a WhatsApp status update")
+        
+        # Check for failed media downloads
+        statuses = body.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("statuses", [])
+        for status in statuses:
+            if status.get("status") == "failed":
+                errors = status.get("errors", [])
+                for error in errors:
+                    if error.get("code") == 131052:  # Media download error
+                        logger.error("Media download failed", 
+                                   recipient_id=status.get("recipient_id"),
+                                   error_code=error.get("code"),
+                                   error_title=error.get("title"),
+                                   error_message=error.get("message"))
+                        
+                        # Send notification to user about failed media download
+                        try:
+                            from .services.whatsapp_service import whatsapp_service
+                            
+                            # Get the recipient ID and format it properly
+                            recipient_id = status.get("recipient_id")
+                            if recipient_id:
+                                # Add + prefix if not present
+                                if not recipient_id.startswith("+"):
+                                    recipient_id = "+" + recipient_id
+                                
+                                # Send error message to user
+                                error_message = "מצטער, לא הצלחתי להוריד את הקובץ. אנא נסה לשלוח שוב או פנה לצוות התמיכה."
+                                
+                                # Capture the app instance from current context
+                                app_instance = current_app._get_current_object()
+                                
+                                # Create new event loop for this thread
+                                def send_error_message():
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        # Push app context to the thread using the captured app instance
+                                        with app_instance.app_context():
+                                            loop.run_until_complete(whatsapp_service.send_text_message(recipient_id, error_message))
+                                            logger.info("Error message sent to user", recipient_id=recipient_id)
+                                    finally:
+                                        loop.close()
+                                
+                                # Send in background thread
+                                thread = threading.Thread(target=send_error_message)
+                                thread.start()
+                                
+                        except Exception as send_error:
+                            logger.error("Failed to send media download error message", error=str(send_error))
+        
         return jsonify({"status": "ok"}), 200
 
     try:

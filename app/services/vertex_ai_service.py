@@ -388,6 +388,44 @@ class VertexAIService:
             logger.error("Error parsing response data", error=str(e))
             return {}
 
+    async def generate_ai_response(self, prompt: str) -> str:
+        """
+        Generate AI response using Vertex AI.
+        
+        Args:
+            prompt: The prompt to send to the AI model
+            
+        Returns:
+            Generated response in Hebrew
+        """
+        try:
+            self._ensure_initialized()
+            
+            if not self.client:
+                raise Exception("Vertex AI client not initialized")
+            
+            # Generate response using the correct Vertex AI format
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash-exp",
+                contents=prompt,
+                config={
+                    "temperature": 0.7,
+                    "max_output_tokens": 1024,
+                    "top_p": 0.8,
+                    "top_k": 40
+                }
+            )
+            
+            if response and response.text:
+                return response.text.strip()
+            else:
+                logger.warning("Empty response from Vertex AI")
+                return "מצטער, לא הצלחתי לייצר תגובה. אנא נסה שוב."
+                
+        except Exception as e:
+            logger.error("Error generating AI response", error=str(e))
+            return "מצטער, אירעה שגיאה. אנא נסה שוב."
+
     async def generate_contextual_response(self, conversation_state: str, context: Dict[str, Any], user_message: str) -> str:
         """
         Generate a contextual response based on conversation state and user input.

@@ -873,7 +873,7 @@ class DocumentAIService:
             # Process document using existing logic
             result = await self.process_document(file_data, document_type, guarantor_info)
             
-            if result.get("is_valid", False):
+            if result.get("validation_result", {}).get("is_valid", False):
                 # Update guarantor documents status
                 from .guarantor_service import guarantor_service
                 await guarantor_service.update_guarantor_documents_status(
