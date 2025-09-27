@@ -123,9 +123,28 @@ async def process_whatsapp_message(body):
 
 def is_valid_whatsapp_message(body):
     """
-    Check if the incoming webhook event has a valid WhatsApp message structure.
+    Check if the incoming webhook event has a valid WhatsApp message structure
+    and is intended for this bot's phone number.
     """
-    return whatsapp_service.is_valid_webhook_message(body)
+    if not whatsapp_service.is_valid_webhook_message(body):
+        return False
+    
+    # Validate that the message is for this bot's phone number
+    try:
+        configured_phone_id = current_app.config.get("PHONE_NUMBER_ID")
+        webhook_phone_id = body["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"]
+        
+        if configured_phone_id != webhook_phone_id:
+            logger.info("Ignoring message for different phone number", 
+                       configured_phone_id=configured_phone_id,
+                       webhook_phone_id=webhook_phone_id)
+            return False
+            
+        return True
+        
+    except (KeyError, IndexError) as e:
+        logger.error("Failed to extract phone_number_id from webhook", error=str(e))
+        return False
 
 
 # Legacy functions for backward compatibility
