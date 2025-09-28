@@ -11,7 +11,6 @@ from datetime import datetime
 import json
 
 from app.services.vertex_ai_service import vertex_ai_service
-from app.services.supabase_service import supabase_service
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +20,107 @@ class AIConversationService:
     
     def __init__(self):
         self.vertex_ai_service = vertex_ai_service
-        self.supabase_service = supabase_service
     
+    async def generate_media_error_response(self, phone_number: str, user_message: str, 
+                                           error_context: Dict[str, Any]) -> str:
+        """
+        Generate AI response for media download failures.
+        
+        Args:
+            phone_number: User's phone number
+            user_message: User's original message
+            error_context: Context about the error
+            
+        Returns:
+            AI-generated error response in Hebrew
+        """
+        try:
+            logger.info("Generating AI media error response", extra={
+                "phone_number": phone_number,
+                "error_type": error_context.get("error_type"),
+                "retry_attempts": error_context.get("retry_attempts")
+            })
+            
+            # Build AI prompt for media error based on error type
+            error_type = error_context.get('error_type', 'media_download_failed')
+            retry_attempts = error_context.get('retry_attempts', 0)
+            
+            if error_type == "webhook_media_download_failed":
+                # This is from WhatsApp's webhook - likely file format issue
+                suggestions = error_context.get('suggestions', [])
+                suggestions_text = "\n".join([f"• {suggestion}" for suggestion in suggestions]) if suggestions else ""
+                
+                prompt = f"""
+אתה יוני ממגורית, עוזר נדלן ידידותי.
+
+המשתמש שלח קובץ (תמונה/מסמך) אבל WhatsApp לא הצליח לעבד אותו.
+
+המצב:
+- זה לא בעיה במערכת שלנו
+- WhatsApp לא הצליח לעבד את הקובץ
+- זה יכול להיות בגלל פורמט הקובץ או גודלו
+
+הוראות:
+- הסבר בעברית טבעית מה קרה
+- אל תאשים את המערכת שלנו
+- תן טיפים מעשיים לשיפור:
+{suggestions_text}
+- בקש מהמשתמש לנסות שוב עם תמונה אחרת
+- היה אמפתי ומועיל
+- הצע חלופה: לכתוב במילים מה רצה לשלוח
+
+תגובה קצרה ומועילה:
+"""
+            else:
+                # Regular media download failure
+                prompt = f"""
+אתה יוני ממגורית, עוזר נדלן ידידותי.
+
+המשתמש שלח קובץ (תמונה/מסמך) אבל לא הצלחתי להוריד אותו.
+
+פרטי השגיאה:
+- ניסיתי {retry_attempts} פעמים להוריד
+- הבעיה יכולה להיות ברשת או ב-WhatsApp
+- הודעה מקורית: {user_message}
+
+הוראות:
+- הסבר בעברית טבעית מה קרה
+- בקש מהמשתמש לנסות לשלוח שוב
+- תן טיפ: אולי לחכות דקה ולנסות שוב
+- היה אמפתי ומועיל
+- אל תציג את עצמך שוב
+- השתמש בטון חם אבל מקצועי
+- הצע חלופה: לכתוב במילים מה רצה לשלוח
+
+תגובה קצרה ומועילה:
+"""
+            
+            # Generate AI response
+            ai_response = await self.vertex_ai_service.generate_response(prompt)
+            
+            # Apply WhatsApp formatting
+            formatted_response = self.vertex_ai_service._format_ai_response_for_whatsapp(ai_response)
+            
+            logger.info("AI media error response generated successfully", extra={
+                "phone_number": phone_number,
+                "response_length": len(formatted_response)
+            })
+            
+            return formatted_response
+            
+        except Exception as e:
+            logger.error("Error generating AI media error response", extra={
+                "phone_number": phone_number,
+                "error": str(e)
+            })
+            # Fallback response
+            return "מצטער, לא הצלחתי להוריד את הקובץ. זה בעיה זמנית של WhatsApp. אנא נסה לשלוח שוב בעוד כמה דקות."
+
     async def generate_response(self, phone_number: str, user_message: str, 
                               conversation_type: str, current_state: str, 
                               context_data: Dict[str, Any]) -> str:
         """
-        Generate AI response for both tenants and guarantors.
+        Generate AI response for both tenants and guarantors using enhanced human-like responses.
         
         Args:
             phone_number: User's phone number
@@ -37,41 +130,34 @@ class AIConversationService:
             context_data: Context data from conversation state
             
         Returns:
-            AI-generated response in Hebrew
+            AI-generated response in Hebrew with human-like tone and proper formatting
         """
         try:
-            logger.info("Generating AI response", extra={
+            logger.info("Generating enhanced AI response", extra={
                 "phone_number": phone_number,
                 "conversation_type": conversation_type,
                 "current_state": current_state,
                 "context_data": context_data
             })
             
-            # Get conversation history with token limit
-            history = await self._get_conversation_history_with_token_limit(phone_number, conversation_type)
+            # Get conversation history (simplified approach)
+            conversation_history = await self._get_simple_conversation_history(phone_number, conversation_type)
             
-            # Get personality data
-            personality = await self._get_conversation_personality(phone_number, conversation_type)
-            
-            # Build AI prompt
-            prompt = await self._build_ai_prompt(
+            # Use the new enhanced human-like AI response generation
+            ai_response = await self.vertex_ai_service.generate_human_like_response(
                 conversation_type=conversation_type,
                 current_state=current_state,
                 context_data=context_data,
-                conversation_history=history,
-                personality=personality,
-                user_message=user_message
+                user_message=user_message,
+                conversation_history=conversation_history
             )
             
-            # Generate response using Vertex AI
-            ai_response = await self.vertex_ai_service.generate_ai_response(prompt)
-            
-            # Store the AI response in conversation history
-            await self._store_message_history(
-                phone_number, conversation_type, "bot_response", ai_response, current_state, context_data
+            # Store the AI response in conversation history (simplified)
+            await self._store_simple_message_history(
+                phone_number, conversation_type, "bot_response", ai_response, current_state
             )
             
-            logger.info("AI response generated successfully", extra={
+            logger.info("Enhanced AI response generated successfully", extra={
                 "phone_number": phone_number,
                 "response_length": len(ai_response)
             })
@@ -79,13 +165,87 @@ class AIConversationService:
             return ai_response
             
         except Exception as e:
-            logger.error("Error generating AI response", extra={
+            logger.error("Error generating enhanced AI response", extra={
                 "phone_number": phone_number,
                 "conversation_type": conversation_type,
                 "error": str(e)
             })
             # Fallback to default response
-            return await self._get_fallback_response(conversation_type, current_state)
+            return self._get_safe_fallback_response(conversation_type, current_state)
+
+    async def _get_simple_conversation_history(self, phone_number: str, conversation_type: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get simple conversation history for AI context."""
+        try:
+            # Try to use supabase service if available
+            from app.services.supabase_service import supabase_service
+            
+            result = supabase_service.client.rpc(
+                'get_conversation_history_for_ai',
+                {
+                    'p_phone_number': phone_number,
+                    'p_conversation_type': conversation_type,
+                    'p_limit': limit
+                }
+            ).execute()
+            
+            if result.data:
+                return result.data
+            return []
+            
+        except Exception as e:
+            logger.error("Error getting conversation history", extra={
+                "phone_number": phone_number,
+                "conversation_type": conversation_type,
+                "error": str(e)
+            })
+            return []
+
+    async def _store_simple_message_history(self, phone_number: str, conversation_type: str, 
+                                          message_type: str, content: str, state: str):
+        """Store message in conversation history."""
+        try:
+            from app.services.supabase_service import supabase_service
+            
+            history_data = {
+                "phone_number": phone_number,
+                "conversation_type": conversation_type,
+                "message_type": message_type,
+                "message_content": content,
+                "conversation_state": state,
+                "context_data": {},
+                "message_timestamp": datetime.now().isoformat()
+            }
+            
+            supabase_service.client.table("conversation_history").insert(history_data).execute()
+            
+        except Exception as e:
+            logger.error("Error storing message history", extra={
+                "phone_number": phone_number,
+                "conversation_type": conversation_type,
+                "error": str(e)
+            })
+
+    def _get_safe_fallback_response(self, conversation_type: str, current_state: str) -> str:
+        """Get safe fallback response when AI fails completely."""
+        fallback_responses = {
+            "tenant": {
+                "GREETING": "שלום! אני יוני ממגורית 😊\n\nאני כאן לעזור לך עם התהליך. איך אני יכול לסייע?",
+                "CONFIRMATION": "אנא אשר את הפרטים שיש לי 📋\n\n**האם הפרטים נכונים?**",
+                "PERSONAL_INFO": "אני צריך עוד קצת מידע אישי 📝\n\n**מה העיסוק שלך?**",
+                "DOCUMENTS": "עכשיו אני צריך מסמכים 📄\n\n**תוכל לשלוח את תעודת הזהות שלך?**",
+                "GUARANTOR_1": "אני צריך פרטי ערב ראשון 👥\n\n**מה השם המלא של הערב הראשון?**",
+                "GUARANTOR_2": "אני צריך פרטי ערב שני 👥\n\n**מה השם המלא של הערב השני?**",
+                "COMPLETED": "מעולה! התהליך הושלם בהצלחה 🎉\n\nתודה על שיתוף הפעולה!"
+            },
+            "guarantor": {
+                "GREETING": "שלום! אני יוני ממגורית 😊\n\nאני צריך את המסמכים שלך כערב. נתחיל?",
+                "DOCUMENTS": "אני צריך את המסמכים שלך 📄\n\n**תוכל לשלוח את תעודת הזהות שלך?**",
+                "COMPLETED": "מעולה! כל המסמכים התקבלו 🎉\n\nתודה על שיתוף הפעולה!"
+            }
+        }
+        
+        return fallback_responses.get(conversation_type, {}).get(current_state, 
+            "אני כאן לעזור לך 😊\n\nתוכל לספר לי איך אני יכול לסייע?")
     
     async def _get_conversation_history(self, phone_number: str, conversation_type: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Get conversation history for AI context."""

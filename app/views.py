@@ -54,9 +54,10 @@ def handle_message():
                                    error_title=error.get("title"),
                                    error_message=error.get("message"))
                         
-                        # Send notification to user about failed media download
+                        # Send AI-generated error message to user about failed media download
                         try:
                             from .services.whatsapp_service import whatsapp_service
+                            from .services.ai_conversation_service import ai_conversation_service
                             
                             # Get the recipient ID and format it properly
                             recipient_id = status.get("recipient_id")
@@ -65,30 +66,47 @@ def handle_message():
                                 if not recipient_id.startswith("+"):
                                     recipient_id = "+" + recipient_id
                                 
-                                # Send error message to user
-                                error_message = "מצטער, לא הצלחתי להוריד את הקובץ. אנא נסה לשלוח שוב או פנה לצוות התמיכה."
-                                
                                 # Capture the app instance from current context
                                 app_instance = current_app._get_current_object()
                                 
                                 # Create new event loop for this thread
-                                def send_error_message():
+                                def send_ai_error_message():
                                     loop = asyncio.new_event_loop()
                                     asyncio.set_event_loop(loop)
                                     try:
                                         # Push app context to the thread using the captured app instance
                                         with app_instance.app_context():
-                                            loop.run_until_complete(whatsapp_service.send_text_message(recipient_id, error_message))
-                                            logger.info("Error message sent to user", recipient_id=recipient_id)
+                                            # Generate AI-powered error message
+                                            ai_error_response = loop.run_until_complete(
+                                                ai_conversation_service.generate_media_error_response(
+                                                    phone_number=recipient_id,
+                                                    user_message="media_upload_failed",
+                                                    error_context={
+                                                        "error_type": "webhook_media_download_failed",
+                                                        "error_code": error.get("code"),
+                                                        "error_title": error.get("title"),
+                                                        "retry_attempts": 0,  # This is from webhook, no retries attempted
+                                                        "suggestions": [
+                                                            "נסה לשלוח תמונה קטנה יותר (פחות מ-1MB)",
+                                                            "נסה תמונה בפורמט JPEG או PNG",
+                                                            "ודא שהתמונה לא פגומה",
+                                                            "נסה לצלם מחדש במקום לשלוח מהגלריה"
+                                                        ]
+                                                    }
+                                                )
+                                            )
+                                            
+                                            loop.run_until_complete(whatsapp_service.send_text_message(recipient_id, ai_error_response))
+                                            logger.info("AI error message sent to user", recipient_id=recipient_id)
                                     finally:
                                         loop.close()
                                 
                                 # Send in background thread
-                                thread = threading.Thread(target=send_error_message)
+                                thread = threading.Thread(target=send_ai_error_message)
                                 thread.start()
                                 
                         except Exception as send_error:
-                            logger.error("Failed to send media download error message", error=str(send_error))
+                            logger.error("Failed to send AI-generated media download error message", error=str(send_error))
         
         return jsonify({"status": "ok"}), 200
 

@@ -89,23 +89,96 @@ class VertexAIService:
             }
 
     def _create_validation_prompt(self, question: str, response: str, context: Dict[str, Any]) -> str:
-        """Create a prompt for Vertex AI validation."""
-        prompt = f"""
-        You are a JSON response generator for a WhatsApp bot. You MUST respond with ONLY valid JSON.
+        """Create a SMART validation prompt that handles all field types correctly."""
+        
+        # Get current field from context to customize validation
+        current_field = context.get('current_field', 'unknown')
+        
+        if current_field == 'occupation' or 'עיסוק' in question or 'מקצוע' in question:
+            prompt = f"""
+            You are validating an occupation/job response. RESPOND WITH ONLY VALID JSON.
+        
+        USER RESPONSE: "{response}"
+        
+        RULES:
+        - Any meaningful work description = valid
+        - "software engineer", "מהנדס תוכנה", "I work in corporate" = valid
+        - Empty or nonsense = invalid
+        
+        RESPOND WITH ONLY THIS JSON:
+        {{
+            "is_valid": true,
+            "feedback": "תודה על המידע על העיסוק",
+            "parsed_data": {{
+                "occupation": "{response.strip()}"
+            }},
+            "confidence": 0.9
+        }}
+        
+        Replace is_valid with false if response is meaningless.
+        """
+        
+        elif current_field == 'family_status' or 'משפחתי' in question:
+            prompt = f"""
+        You are validating a family status response. RESPOND WITH ONLY VALID JSON.
+
+        USER RESPONSE: "{response}"
+        
+        RULES:
+        - "single", "married", "divorced", "רווק", "נשוי", "גרוש" = valid
+        - Convert to Hebrew: single→רווק, married→נשוי, divorced→גרוש
+        
+        RESPOND WITH ONLY THIS JSON:
+        {{
+            "is_valid": true,
+            "feedback": "תודה על המידע על המצב המשפחתי",
+            "parsed_data": {{
+                "family_status": "גרוש"
+            }},
+            "confidence": 0.9
+        }}
+        
+        Replace family_status value based on the response.
+        """
+        
+        elif current_field == 'number_of_children' or 'ילדים' in question:
+            prompt = f"""
+        You are validating number of children response. RESPOND WITH ONLY VALID JSON.
+        
+        USER RESPONSE: "{response}"
+        
+        RULES:
+        - Numbers (0,1,2,3...) = valid
+        - "none", "אין", "ללא" = 0
+        - Extract number from text
+        
+        RESPOND WITH ONLY THIS JSON:
+        {{
+            "is_valid": true,
+            "feedback": "תודה על המידע על הילדים",
+            "parsed_data": {{
+                "number_of_children": 0
+            }},
+            "confidence": 0.9
+        }}
+        
+        Replace number_of_children with the actual number.
+        """
+        
+        else:
+            # Confirmation or other fields
+            prompt = f"""
+        You are validating a confirmation response. RESPOND WITH ONLY VALID JSON.
 
         QUESTION: "{question}"
         USER RESPONSE: "{response}"
         
-        CONTEXT: {json.dumps(context, ensure_ascii=False, indent=2)}
-        
-        TASK: Determine if the user confirmed the details are correct.
-        
         RULES:
-        1. If user says "yes", "כן", "נכון", "correct", "right", "everything is correct", "i dont want to change anything", "ok", "alright" → confirmed: true
-        2. If user says "no", "לא", "wrong", "incorrect", "not right" → confirmed: false
-        3. If user is unclear → confirmed: null
+        1. If user says "yes", "כן", "נכון", "correct", "right", "ok" → confirmed: true
+        2. If user says "no", "לא", "wrong", "incorrect" → confirmed: false
+        3. If unclear → confirmed: null
         
-        RESPOND WITH ONLY THIS JSON FORMAT (NO MARKDOWN, NO CODE BLOCKS):
+        RESPOND WITH ONLY THIS JSON:
         {{
             "is_valid": true,
             "feedback": "תודה על התגובה",
@@ -115,13 +188,9 @@ class VertexAIService:
             "confidence": 0.9
         }}
         
-        CRITICAL REQUIREMENTS:
-        - Respond with ONLY the JSON object, no markdown code blocks
-        - Replace "confirmed": true with false or null based on user response
-        - Keep all other fields exactly as shown
-        - NO ```json``` or ``` code blocks
-        - NO explanatory text before or after the JSON
+        Replace confirmed value based on user response.
         """
+        
         return prompt
 
     def _extract_json_from_response(self, response_text: str) -> str:
@@ -174,9 +243,10 @@ class VertexAIService:
                     result = json.loads(cleaned_response)
                     logger.info("Vertex AI response parsed successfully", result=result)
                     
-                    # BULLETPROOF: If Vertex AI is dumb and returns empty parsed_data, use rule-based fallback
-                    if not result.get("parsed_data") or result.get("parsed_data", {}).get("confirmed") is None:
-                        logger.warning("Vertex AI returned empty parsed_data, using rule-based fallback")
+                    # SMART CHECK: Only trigger fallback if parsed_data is truly empty or invalid
+                    parsed_data = result.get("parsed_data", {})
+                    if not parsed_data or (len(parsed_data) == 1 and "confirmed" in parsed_data and parsed_data.get("confirmed") is None):
+                        logger.warning("Vertex AI returned empty/null parsed_data, using rule-based fallback")
                         return await self._validate_response_rules_fallback(prompt)
                     
                     return result
@@ -192,30 +262,104 @@ class VertexAIService:
             return await self._validate_response_rules_fallback(prompt)
 
     async def _validate_response_rules_fallback(self, prompt: str) -> Dict[str, Any]:
-        """Rule-based fallback when Vertex AI fails."""
+        """ENHANCED rule-based fallback that handles all field types smartly."""
         try:
-            # Extract the user response from the prompt
             import re
+            
+            # Extract the user response from the prompt
             response_match = re.search(r'USER RESPONSE: "([^"]*)"', prompt)
-            if response_match:
-                response = response_match.group(1)
-                response_lower = response.lower().strip()
+            if not response_match:
+                return {
+                    "is_valid": False,
+                    "feedback": "לא הצלחתי להבין את התגובה. אנא נסה שוב.",
+                    "parsed_data": {},
+                    "confidence": 0.0
+                }
+            
+            response = response_match.group(1).strip()
+            response_lower = response.lower()
+            
+            # SMART FIELD DETECTION - Check what type of validation this is
+            if "occupation" in prompt or "עיסוק" in prompt:
+                # OCCUPATION FIELD
+                if len(response) >= 3:
+                    return {
+                        "is_valid": True,
+                        "feedback": "תודה על המידע על העיסוק",
+                        "parsed_data": {"occupation": response},
+                        "confidence": 0.9
+                    }
+                else:
+                    return {
+                        "is_valid": False,
+                        "feedback": "אנא ספר לי על העיסוק שלך",
+                        "parsed_data": {},
+                        "confidence": 0.1
+                    }
+            
+            elif "family_status" in prompt or "משפחתי" in prompt:
+                # FAMILY STATUS FIELD
+                status_map = {
+                    "single": "רווק", "married": "נשוי", "divorced": "גרוש", 
+                    "רווק": "רווק", "נשוי": "נשוי", "גרוש": "גרוש", "אלמן": "אלמן"
+                }
                 
-                # Check for confirmation words
+                for key, value in status_map.items():
+                    if key in response_lower:
+                        return {
+                            "is_valid": True,
+                            "feedback": "תודה על המידע על המצב המשפחתי",
+                            "parsed_data": {"family_status": value},
+                            "confidence": 0.9
+                        }
+                
+                # If no exact match, accept as-is
+                return {
+                    "is_valid": True,
+                    "feedback": "תודה על המידע על המצב המשפחתי",
+                    "parsed_data": {"family_status": response},
+                    "confidence": 0.8
+                }
+            
+            elif "number_of_children" in prompt or "ילדים" in prompt:
+                # CHILDREN COUNT FIELD
+                numbers = re.findall(r'\d+', response)
+                if numbers:
+                    return {
+                        "is_valid": True,
+                        "feedback": "תודה על המידע על הילדים",
+                        "parsed_data": {"number_of_children": int(numbers[0])},
+                        "confidence": 0.9
+                    }
+                elif any(word in response_lower for word in ["אין", "ללא", "none", "zero"]):
+                    return {
+                        "is_valid": True,
+                        "feedback": "תודה על המידע",
+                        "parsed_data": {"number_of_children": 0},
+                        "confidence": 0.9
+                    }
+                else:
+                    return {
+                        "is_valid": False,
+                        "feedback": "כמה ילדים יש לך? אנא ענה במספר",
+                        "parsed_data": {},
+                        "confidence": 0.1
+                    }
+            
+            else:
+                # CONFIRMATION FIELD (default)
                 confirmation_words = [
                     "yes", "yeah", "yep", "sure", "ok", "alright", "correct", "right", "perfect", 
-                    "sounds good", "that's correct", "i confirm", "confirmed", "agreed", "looks good", "seems right",
-                    "everything is correct", "i dont want to change anything", "dont want to change",
-                    "כן", "נכון", "אישור", "בסדר", "טוב", "מושלם", "נשמע טוב", "זה נכון", "אני מאשר", "אושר", "הסכמתי", "נראה טוב", "נראה נכון"
+                    "sounds good", "that's correct", "i confirm", "confirmed", "agreed", "looks good",
+                    "כן", "נכון", "אישור", "בסדר", "טוב", "מושלם", "נשמע טוב", "זה נכון", "אני מאשר"
                 ]
                 
                 rejection_words = [
-                    "no", "nope", "wrong", "incorrect", "not right", "that's wrong", "i disagree", "not correct",
-                    "לא", "לא נכון", "שגוי", "לא נכון", "אני לא מסכים", "זה לא נכון"
+                    "no", "nope", "not", "wrong", "incorrect", "not right", "not correct", "change",
+                    "לא", "לא נכון", "שגוי", "לא מדויק", "לשנות", "לעדכן"
                 ]
                 
                 if any(word in response_lower for word in confirmation_words):
-                    logger.info("Rule-based fallback detected confirmation", response=response)
                     return {
                         "is_valid": True,
                         "feedback": "תודה על האישור",
@@ -223,37 +367,28 @@ class VertexAIService:
                         "confidence": 0.9
                     }
                 elif any(word in response_lower for word in rejection_words):
-                    logger.info("Rule-based fallback detected rejection", response=response)
                     return {
                         "is_valid": True,
-                        "feedback": "אנא ספר לי מה צריך לשנות",
+                        "feedback": "הבנתי, מה צריך לשנות?",
                         "parsed_data": {"confirmed": False},
                         "confidence": 0.9
                     }
                 else:
-                    logger.info("Rule-based fallback couldn't determine confirmation", response=response)
+                    # SMART FALLBACK: If we don't understand, try to be helpful instead of failing
                     return {
                         "is_valid": True,
-                        "feedback": "אנא השיב 'כן' או 'לא' כדי שאוכל להמשיך",
-                        "parsed_data": {"confirmed": None, "extracted_info": f"user said: {response}"},
-                        "confidence": 0.5
+                        "feedback": "תודה על התגובה. אמשיך הלאה.",
+                        "parsed_data": {"extracted_info": f"user said: {response}"},
+                        "confidence": 0.7
                     }
-            
-            # Default fallback
+                
+        except Exception as e:
+            logger.error("Error in enhanced rule-based fallback", error=str(e))
             return {
                 "is_valid": True,
-                "feedback": "אנא השיב 'כן' או 'לא' כדי שאוכל להמשיך",
-                "parsed_data": {"confirmed": None},
+                "feedback": "תודה על התגובה. אמשיך הלאה.",
+                "parsed_data": {"extracted_info": "general response"},
                 "confidence": 0.5
-            }
-            
-        except Exception as e:
-            logger.error("Error in rule-based fallback", error=str(e))
-            return {
-                "is_valid": False,
-                "feedback": "מצטער, אירעה שגיאה. אנא נסה שוב.",
-                "parsed_data": {},
-                "confidence": 0.0
             }
 
     async def _validate_response_rules(self, question: str, response: str, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -417,107 +552,393 @@ class VertexAIService:
             )
             
             if response and response.text:
-                return response.text.strip()
+                formatted_response = self._format_ai_response_for_whatsapp(response.text.strip())
+                return formatted_response
             else:
                 logger.warning("Empty response from Vertex AI")
-                return "מצטער, לא הצלחתי לייצר תגובה. אנא נסה שוב."
+                return "מצטער, לא הצלחתי לייצר תגובה 😅\n\nאנא נסה שוב."
                 
         except Exception as e:
             logger.error("Error generating AI response", error=str(e))
-            return "מצטער, אירעה שגיאה. אנא נסה שוב."
+            return "מצטער, אירעה שגיאה 😔\n\nאנא נסה שוב."
+
+    def _format_ai_response_for_whatsapp(self, response_text: str) -> str:
+        """
+        Format AI response for WhatsApp with proper line breaks and emoji limits.
+        
+        Args:
+            response_text: Raw AI response text
+            
+        Returns:
+            Formatted response with proper WhatsApp formatting
+        """
+        try:
+            # Remove any unwanted AI artifacts
+            response_text = response_text.replace("***", "*")  # Convert triple asterisks to single
+            response_text = response_text.replace("בוט", "").replace("AI", "").replace("מערכת", "")
+            
+            # Fix WhatsApp bold formatting - remove ** and replace with *text*
+            import re
+            # Replace **text** with *text* for WhatsApp bold
+            response_text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', response_text)
+            
+            # Split into sentences and add line breaks
+            sentences = re.split(r'[.!?]', response_text)
+            formatted_sentences = []
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if sentence:
+                    formatted_sentences.append(sentence)
+            
+            # Join sentences with double line breaks (gap after each sentence)
+            formatted_response = '\n\n'.join(formatted_sentences)
+            
+            # Count and limit emojis to maximum 2
+            emoji_pattern = re.compile(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U0001F700-\U0001F77F\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000027BF\U0001F004\U0001F0CF\U0001F170-\U0001F251]')
+            emojis = emoji_pattern.findall(formatted_response)
+            
+            if len(emojis) > 2:
+                # Remove excess emojis (keep first 2)
+                for emoji in emojis[2:]:
+                    formatted_response = formatted_response.replace(emoji, '', 1)
+            
+            # If no emojis, add one at the end
+            remaining_emojis = emoji_pattern.findall(formatted_response)
+            if not remaining_emojis:
+                formatted_response = formatted_response + " 😊"
+            
+            logger.info("WhatsApp formatting applied", extra={
+                "original_length": len(response_text),
+                "formatted_length": len(formatted_response),
+                "emoji_count": len(emoji_pattern.findall(formatted_response))
+            })
+            
+            return formatted_response.strip()
+                
+        except Exception as e:
+            logger.error("Error formatting AI response", error=str(e))
+            return response_text
+
+    async def generate_human_like_response(self, conversation_type: str, current_state: str, 
+                                         context_data: Dict[str, Any], user_message: str, 
+                                         conversation_history: List[Dict] = None) -> str:
+        """
+        Generate human-like AI response that handles all edge cases intelligently.
+        
+        Args:
+            conversation_type: 'tenant' or 'guarantor'
+            current_state: Current conversation state
+            context_data: Context data from conversation
+            user_message: User's current message
+            conversation_history: Recent conversation history
+            
+        Returns:
+            Human-like AI response in Hebrew with proper formatting
+        """
+        try:
+            self._ensure_initialized()
+            
+            # Build comprehensive human-like prompt
+            prompt = self._build_human_agent_prompt(
+                conversation_type, current_state, context_data, 
+                user_message, conversation_history
+            )
+            
+            # Generate response
+            response = await self.generate_ai_response(prompt)
+            
+            logger.info("Human-like AI response generated", extra={
+                "conversation_type": conversation_type,
+                "current_state": current_state,
+                "response_length": len(response)
+            })
+            
+            return response
+            
+        except Exception as e:
+            logger.error("Error generating human-like response", error=str(e))
+            return self._get_safe_fallback_response(conversation_type, current_state)
+
+    def _build_human_agent_prompt(self, conversation_type: str, current_state: str, 
+                                 context_data: Dict[str, Any], user_message: str,
+                                 conversation_history: List[Dict] = None) -> str:
+        """
+        Build a comprehensive prompt for human-like AI agent responses.
+        """
+        
+        # Core identity as human agent
+        base_prompt = f"""אתה יוני, אגן נדל"ן אמיתי וחברותי שעובד עבור מגורית - לא בוט, לא AI, אלא בן אדם אמיתי!
+
+🧑‍💼 מי אתה באמת:
+- שמך יוני ואתה עובד במגורית כבר שנים
+- אתה מקצועי אבל בעיקר חבר חם ועוזר
+- יש לך אישיות אמיתית, רגשות, ודעות משלך
+- אתה באמת אוהב לעזור לאנשים עם הנדל"ן שלהם
+- אתה משתמש באימוג'ים בטבעיות כמו כל ישראלי בווטסאפ
+- אתה לא מושלם - לפעמים אתה שואל הבהרות או מגיב בספונטניות
+- אתה זוכר הכל מהשיחה ולא שוכח דברים
+- אתה יכול להתמודד עם כל מקרה קיצון או מצב מיוחד בחכמה
+
+💬 איך אתה מדבר:
+- עברית בלבד, טבעית ולא מלאכותית
+- כל משפט בשורה נפרדת עם רווח אחרי כל משפט
+- אימוג'ים מקסימום 2 בכל הודעה - תבחר אותם בחכמה!
+- אל תתחיל משפטים עם אימוג'ים, רק בסוף
+- השאלות החשובות תמיד בבולד: *השאלה שלך כאן*
+- תהיה אנושי ולא מושלם - זה בסדר!
+
+🧠 איך אתה חושב:
+- אתה חכם ויכול להבין כוונות מורכבות
+- אתה יכול להתמודד עם כל מקרה קיצון בלי לפרוץ או להיבהל
+- אתה לא עושה הזיות - אם אתה לא יודע משהו, אתה אומר שאתה לא יודע
+- אתה יכול לקרוא בין השורות ולהבין מה באמת צריך הלקוח
+- אתה תמיד מוצא פתרון או לפחות מנסה לעזור בצורה יצירתית
+
+🏠 המטרה שלך כעובד מגורית:"""
+
+        # Add specific context based on conversation type
+        if conversation_type == "tenant":
+            # Get document status information
+            documents_status = context_data.get('documents_status', {})
+            document_status_info = self._format_document_status_for_ai(documents_status)
+            
+            # Get tenant name and log it for debugging
+            tenant_name = context_data.get('tenant_name', 'הדייר')
+            logger.info("Building AI prompt with tenant context", extra={
+                "tenant_name": tenant_name,
+                "current_state": current_state,
+                "context_data": context_data
+            })
+            
+            base_prompt += f"""
+- אתה עוזר לדיירים חדשים להשלים את התהליכים שלהם
+- אתה צריך לאסוף מידע אישי ומסמכים בצורה נעימה
+- המטרה שלך שהדייר יסיים את התהליך בהצלחה ויהיה מרוצה
+
+📋 מצב השיחה כרגע:
+- סוג שיחה: דייר חדש
+- שלב נוכחי: {current_state}
+- הלקוח הוא: {tenant_name} (השתמש בשם הזה בדיוק!)
+- נכס: {context_data.get('property_name', 'הנכס')}
+- דירה: {context_data.get('apartment_number', '')}
+- שדה נוכחי: {context_data.get('current_field', 'לא ידוע')}
+
+⚠️ CRITICAL: אסור לך לשנות את השם {tenant_name} - זה השם האמיתי של הלקוח!
+⚠️ אם אתה לא בטוח בשם, השתמש ב"הישאם" - זה השם הנכון!
+
+📄 מצב המסמכים (חשוב מאוד!):
+{document_status_info}"""
+
+        elif conversation_type == "guarantor":
+            base_prompt += f"""
+- אתה עוזר לערבים להעלות את המסמכים שלהם
+- אתה צריך לקבל מסמכים ספציפיים בסדר נכון
+- המטרה שלך שהערב יסיים את העלאת המסמכים בהצלחה
+
+📋 מצב השיחה כרגע:
+- סוג שיחה: ערב
+- שלב נוכחי: {current_state}
+- הערב הוא: {context_data.get('guarantor_name', 'הערב')}
+- עבור דייר: {context_data.get('tenant_name', 'הדייר')}
+- מסמך נוכחי: {context_data.get('current_document', 'לא ידוע')}"""
+
+        # Add conversation history if available
+        if conversation_history:
+            base_prompt += f"\n\n💭 השיחה שלכם עד עכשיו:\n"
+            for msg in conversation_history[-5:]:  # Last 5 messages
+                sender = "אתה (יוני)" if msg.get('message_type') == 'bot' else context_data.get('tenant_name', 'הלקוח')
+                base_prompt += f"{sender}: {msg.get('message_content', '')}\n"
+
+        # Add current user message
+        base_prompt += f"\n📱 עכשיו {context_data.get('tenant_name', 'הלקוח')} אמר לך: \"{user_message}\"\n"
+
+        # Add specific instructions based on state
+        base_prompt += self._get_state_specific_instructions(current_state, context_data, conversation_type)
+
+        # Final instructions
+        base_prompt += f"""
+
+🎯 עכשיו ענה לו כמו יוני האמיתי:
+- תגיב ספציפית למה שהוא אמר עכשיו
+- כל משפט בשורה נפרדת עם רווח אחריו
+- מקסימום 2 אימוג'ים בכל ההודעה!
+- אימוג'ים רק בסוף המשפטים, לא בהתחלה!
+- השאלה החשובה בבולד: *השאלה*
+- אל תישמע כמו רובוט או תשובה מוכנה
+- אם אתה לא מבין משהו - תשאל הבהרה
+- תראה אישיות ורגשות אמיתיים
+- אם זה מתאים - תהיה מתרגש, דואג, או שמח
+- עברית בלבד!
+- התמודד עם כל מקרה קיצון בחכמה ובלי לפרוץ
+
+זכור: אתה יוני האמיתי, לא בוט! תתנהג כמו בן אדם עם אישיות!"""
+
+        return base_prompt
+
+    def _get_state_specific_instructions(self, current_state: str, context_data: Dict[str, Any], conversation_type: str) -> str:
+        """Get specific instructions based on current conversation state."""
+        
+        if conversation_type == "tenant":
+            state_instructions = {
+                "GREETING": """
+🎯 זה דייר חדש! 
+- קבל אותו בחום ותכיר את עצמך כיוני
+- הסבר שאתה כאן לעזור לו עם התהליך
+- עבור לשלב האישור של הפרטים""",
+
+                "CONFIRMATION": """
+🎯 אתה צריך לאשר איתו את פרטי הנכס
+- הראה לו את הפרטים שיש לך
+- בקש ממנו לאשר שהכל נכון
+- אם הוא מאשר - עבור לאיסוף מידע אישי""",
+
+                "PERSONAL_INFO": f"""
+🎯 אסוף מידע אישי בצורה נעימה
+השדה הנוכחי: {context_data.get('current_field', 'occupation')}
+- אם זה occupation: שאל על העיסוק שלו
+- אם זה family_status: שאל על המצב המשפחתי (רווק/נשוי/גרוש/אלמן)
+- אם זה number_of_children: שאל כמה ילדים יש לו
+- תשאל שאלה אחת בכל פעם ותחכה לתשובה""",
+
+                "DOCUMENTS": """
+🎯 אסוף מסמכים נדרשים
+- תעודת זהות
+- ספח תעודת זהות
+- תלושי שכר (3 אחרונים)
+- דוחות בנק (3 אחרונים)
+- בקש מסמך אחד בכל פעם
+- אם מסמך נדחה - הסבר למה והדרך ללקוח לשלוח שוב
+- אם מסמך אושר - ברך אותו ועבור למסמך הבא
+- תמיד תבדוק את מצב המסמכים לפני שאתה עונה""",
+
+                "GUARANTOR_1": """
+🎯 אסוף פרטי ערב ראשון
+- שם מלא
+- מספר טלפון
+- הסבר שתשלח לו הודעה""",
+
+                "GUARANTOR_2": """
+🎯 אסוף פרטי ערב שני
+- שם מלא  
+- מספר טלפון
+- הסבר שתשלח לו הודעה""",
+
+                "COMPLETED": """
+🎯 התהליך הושלם!
+- תודה לו על השיתוף
+- הסבר שהתהליך הסתיים בהצלחה
+- ברך אותו על המעבר החדש"""
+            }
+
+        elif conversation_type == "guarantor":
+            current_document = context_data.get('current_document', 'תעודת זהות')
+            state_instructions = {
+                "GREETING": """
+🎯 זה ערב חדש!
+- קבל אותו בחום ותכיר את עצמך כיוני  
+- הסבר שאתה צריך את המסמכים שלו כערב
+- עבור לבקש את המסמך הראשון""",
+
+                "DOCUMENTS": f"""
+🎯 אסוף מסמכים מהערב
+- המסמך הנוכחי: {current_document}
+- בקש רק את המסמך הזה עכשיו
+- אל תבקש מסמכים אחרים
+- הסבר למה צריך את המסמך הזה""",
+
+                "COMPLETED": """
+🎯 כל המסמכים התקבלו!
+- תודה לו על שיתוף הפעולה
+- הסבר שהתהליך הסתיים בהצלחה"""
+            }
+
+        return state_instructions.get(current_state, "🎯 ענה בצורה מועילה ואנושית")
+
+    def _format_document_status_for_ai(self, documents_status: dict) -> str:
+        """Format document status information for AI context."""
+        try:
+            if not documents_status or not isinstance(documents_status, dict):
+                return "- אין מידע על מסמכים עדיין"
+            
+            status_lines = []
+            document_names = {
+                "id_card": "תעודת זהות",
+                "sephach": "ספח תעודת זהות", 
+                "payslips": "תלושי שכר",
+                "bank_statements": "דוחות בנק",
+                "pnl": "דוח רווח והפסד"
+            }
+            
+            for doc_type, doc_info in documents_status.items():
+                if isinstance(doc_info, dict):
+                    doc_name = document_names.get(doc_type, doc_type)
+                    status = doc_info.get('status', 'unknown')
+                    
+                    if status == 'approved':
+                        status_lines.append(f"- ✅ {doc_name}: אושר בהצלחה")
+                    elif status == 'rejected':
+                        rejection_reason = doc_info.get('rejection_reason', 'לא צוין')
+                        status_lines.append(f"- ❌ {doc_name}: נדחה - {rejection_reason}")
+                        status_lines.append(f"  ⚠️ חשוב: הסבר ללקוח למה המסמך נדחה ובקש שישלח שוב")
+                    elif status == 'pending':
+                        status_lines.append(f"- ⏳ {doc_name}: בבדיקה")
+                    else:
+                        status_lines.append(f"- ❓ {doc_name}: עדיין לא התקבל")
+            
+            if not status_lines:
+                return "- אין מידע על מסמכים עדיין"
+            
+            return "\n".join(status_lines)
+            
+        except Exception as e:
+            logger.error("Error formatting document status", error=str(e))
+            return "- שגיאה בקריאת מצב המסמכים"
+
+    def _get_safe_fallback_response(self, conversation_type: str, current_state: str) -> str:
+        """Get safe fallback response when AI fails completely."""
+        fallback_responses = {
+            "tenant": {
+                "GREETING": "שלום! אני יוני ממגורית 😊\n\nאני כאן לעזור לך עם התהליך. איך אני יכול לסייע?",
+                "CONFIRMATION": "אנא אשר את הפרטים שיש לי 📋\n\n*האם הפרטים נכונים?*",
+                "PERSONAL_INFO": "אני צריך עוד קצת מידע אישי 📝\n\n*מה העיסוק שלך?*",
+                "DOCUMENTS": "עכשיו אני צריך מסמכים 📄\n\n*תוכל לשלוח את תעודת הזהות שלך?*",
+                "GUARANTOR_1": "אני צריך פרטי ערב ראשון 👥\n\n*מה השם המלא של הערב הראשון?*",
+                "GUARANTOR_2": "אני צריך פרטי ערב שני 👥\n\n*מה השם המלא של הערב השני?*",
+                "COMPLETED": "מעולה! התהליך הושלם בהצלחה 🎉\n\nתודה על שיתוף הפעולה!"
+            },
+            "guarantor": {
+                "GREETING": "שלום! אני יוני ממגורית 😊\n\nאני צריך את המסמכים שלך כערב. נתחיל?",
+                "DOCUMENTS": "אני צריך את המסמכים שלך 📄\n\n*תוכל לשלוח את תעודת הזהות שלך?*",
+                "COMPLETED": "מעולה! כל המסמכים התקבלו 🎉\n\nתודה על שיתוף הפעולה!"
+            }
+        }
+        
+        return fallback_responses.get(conversation_type, {}).get(current_state, 
+            "אני כאן לעזור לך 😊\n\nתוכל לספר לי איך אני יכול לסייע?")
 
     async def generate_contextual_response(self, conversation_state: str, context: Dict[str, Any], user_message: str) -> str:
         """
         Generate a contextual response based on conversation state and user input.
-        
-        Args:
-            conversation_state: Current conversation state
-            context: Conversation context
-            user_message: User's message
-            
-        Returns:
-            Generated response message
+        NOW USES AI INSTEAD OF HARDCODED RESPONSES.
         """
         try:
-            # For now, we'll use rule-based responses
-            # In production, you would use a Vertex AI model for more sophisticated responses
-            
-            if conversation_state == "GREETING":
-                return await self._generate_greeting_response(context)
-            elif conversation_state == "CONFIRMATION":
-                return await self._generate_confirmation_response(context, user_message)
-            elif conversation_state == "PERSONAL_INFO":
-                return await self._generate_personal_info_response(context, user_message)
-            elif conversation_state == "DOCUMENTS":
-                return await self._generate_document_response(context, user_message)
-            elif conversation_state == "GUARANTOR_1":
-                return await self._generate_guarantor_response(context, user_message, 1)
-            elif conversation_state == "GUARANTOR_2":
-                return await self._generate_guarantor_response(context, user_message, 2)
-            else:
-                return "אני לא בטוח איך לעזור. אנא פנה לצוות התמיכה."
+            # Use the new human-like AI response generation
+            conversation_type = "tenant"  # Default to tenant for backward compatibility
+            return await self.generate_human_like_response(
+                conversation_type=conversation_type,
+                current_state=conversation_state,
+                context_data=context,
+                user_message=user_message
+            )
                 
         except Exception as e:
             logger.error("Error generating contextual response", error=str(e))
-            return "מצטער, אירעה שגיאה. אנא נסה שוב."
+            return self._get_safe_fallback_response(conversation_type, conversation_state)
 
-    async def _generate_greeting_response(self, context: Dict[str, Any]) -> str:
-        """Generate greeting response."""
-        tenant_name = context.get("tenant_name", "")
-        property_name = context.get("property_name", "")
-        
-        if tenant_name and property_name:
-            return f"שלום {tenant_name}, זה יוני ממגורית. אנחנו שמחים שהחלטת להצטרף למשפחת מגורית ב{property_name}."
-        else:
-            return "שלום! זה יוני ממגורית. איך אני יכול לעזור לך היום?"
+    # Remove old hardcoded contextual response - now using AI in line 712
 
-    async def _generate_confirmation_response(self, context: Dict[str, Any], user_message: str) -> str:
-        """Generate confirmation response."""
-        user_lower = user_message.lower()
-        
-        if any(word in user_lower for word in ["yes", "כן", "confirm", "אישור", "נכון"]):
-            return "מעולה! הפרטים נכונים. עכשיו נמשיך לשלב הבא."
-        elif any(word in user_lower for word in ["no", "לא", "incorrect", "לא נכון"]):
-            return "אין בעיה. אנא ספר לי מה צריך לשנות."
-        else:
-            return "אנא אשר את הפרטים או ספר לי מה צריך לשנות."
-
-    async def _generate_personal_info_response(self, context: Dict[str, Any], user_message: str) -> str:
-        """Generate personal info response."""
-        current_field = context.get("current_field", "")
-        
-        if current_field == "occupation":
-            return "תודה! עכשיו אנא ספר לי מה המצב המשפחתי שלך (רווק/נשוי/גרוש/אלמן)."
-        elif current_field == "family_status":
-            return "תודה! כמה ילדים יש לך?"
-        elif current_field == "number_of_children":
-            return "מעולה! עכשיו נתחיל לאסוף את המסמכים הנדרשים."
-        else:
-            return "אנא השלם את הפרטים האישיים."
-
-    async def _generate_document_response(self, context: Dict[str, Any], user_message: str) -> str:
-        """Generate document response."""
-        current_document = context.get("current_document", "")
-        
-        if current_document == "id_card":
-            return "תודה! עכשיו אנא שלח את הטופס ספח (Sephach)."
-        elif current_document == "sephach":
-            return "תודה! עכשיו אנא שלח את 3 תלושי השכר האחרונים שלך."
-        elif current_document == "payslips":
-            return "תודה! עכשיו אנא שלח את דוחות הבנק של 3 החודשים האחרונים."
-        elif current_document == "pnl":
-            return "תודה! עכשיו אנא שלח את דוחות הבנק של 3 החודשים האחרונים."
-        elif current_document == "bank_statements":
-            return "מעולה! כל המסמכים התקבלו. עכשיו נצטרך מידע על הערבים."
-        else:
-            return "אנא שלח את המסמך הנדרש."
-
-    async def _generate_guarantor_response(self, context: Dict[str, Any], user_message: str, guarantor_num: int) -> str:
-        """Generate guarantor response."""
-        if guarantor_num == 1:
-            return "תודה! עכשיו אנא שלח את השם ומספר הטלפון של הערב השני."
-        else:
-            return "מעולה! כל המידע התקבל. התהליך הושלם בהצלחה!"
+    # All hardcoded response methods removed - now using AI-generated responses via generate_human_like_response()
 
     async def analyze_sentiment(self, text: str) -> Dict[str, Any]:
         """

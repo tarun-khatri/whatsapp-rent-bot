@@ -286,38 +286,129 @@ class WhatsAppService:
             logger.error("Error sending list message", recipient=recipient, error=str(e))
             raise
 
-    async def download_media(self, media_id: str) -> bytes:
+    async def download_media(self, media_id: str, max_retries: int = 3, retry_delay: float = 1.0) -> bytes:
         """
-        Download media file from WhatsApp Business API.
+        Download media file from WhatsApp Business API with retry logic.
         
         Args:
             media_id: Media ID from the webhook
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay between retries in seconds
             
         Returns:
             Media file data as bytes
+            
+        Raises:
+            Exception: If all retry attempts fail
         """
-        try:
-            # Get media URL
-            media_url_response = await self._make_api_request("GET", f"/{self.version}/{media_id}")
-            media_url = media_url_response.get("url")
-            
-            if not media_url:
-                raise ValueError("Media URL not found in response")
-            
-            # Download media file
-            headers = {
-                "Authorization": f"Bearer {self.access_token}"
-            }
-            
-            response = requests.get(media_url, headers=headers, timeout=30)
-            response.raise_for_status()
-            
-            logger.info("Media downloaded successfully", media_id=media_id, size=len(response.content))
-            return response.content
-            
-        except Exception as e:
-            logger.error("Error downloading media", media_id=media_id, error=str(e))
-            raise
+        self._ensure_initialized()
+        last_exception = None
+        
+        logger.info("Starting media download", extra={
+            "media_id": media_id,
+            "max_retries": max_retries,
+            "access_token_configured": bool(self.access_token),
+            "access_token_length": len(self.access_token) if self.access_token else 0
+        })
+        
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info("Attempting media download", 
+                          media_id=media_id, 
+                          attempt=attempt + 1, 
+                          max_retries=max_retries + 1)
+                
+                # Get media URL first
+                media_url_response = await self._make_api_request("GET", f"/{self.version}/{media_id}")
+                media_url = media_url_response.get("url")
+                
+                logger.info("Media URL retrieved", extra={
+                    "media_id": media_id,
+                    "has_url": bool(media_url),
+                    "url_domain": media_url.split('/')[2] if media_url else None
+                })
+                
+                if not media_url:
+                    raise ValueError("Media URL not found in response")
+                
+                # Download media file with detailed logging
+                headers = {
+                    "Authorization": f"Bearer {self.access_token}",
+                    "User-Agent": "WhatsApp-Business-Bot/1.0"
+                }
+                
+                logger.info("Starting media file download", extra={
+                    "media_url_domain": media_url.split('/')[2],
+                    "headers_count": len(headers)
+                })
+                
+                response = requests.get(media_url, headers=headers, timeout=30)
+                
+                logger.info("Media download response", extra={
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get('content-type'),
+                    "content_length": response.headers.get('content-length'),
+                    "response_size": len(response.content)
+                })
+                
+                response.raise_for_status()
+                
+                logger.info("Media downloaded successfully", 
+                          media_id=media_id, 
+                          size=len(response.content), 
+                          attempt=attempt + 1,
+                          content_type=response.headers.get('content-type'))
+                return response.content
+                
+            except requests.exceptions.HTTPError as e:
+                last_exception = e
+                logger.error("HTTP error during media download", extra={
+                    "media_id": media_id,
+                    "attempt": attempt + 1,
+                    "status_code": e.response.status_code if e.response else None,
+                    "error_response": e.response.text if e.response else None,
+                    "will_retry": attempt < max_retries
+                })
+                
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                logger.error("Request error during media download", extra={
+                    "media_id": media_id,
+                    "attempt": attempt + 1,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "will_retry": attempt < max_retries
+                })
+                
+            except Exception as e:
+                last_exception = e
+                logger.error("Unexpected error during media download", extra={
+                    "media_id": media_id,
+                    "attempt": attempt + 1,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "will_retry": attempt < max_retries
+                })
+                
+            # If this is not the last attempt, wait before retrying
+            if attempt < max_retries:
+                sleep_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                logger.info("Waiting before retry", extra={
+                    "media_id": media_id,
+                    "sleep_seconds": sleep_time,
+                    "next_attempt": attempt + 2
+                })
+                await asyncio.sleep(sleep_time)
+        
+        # If we get here, all attempts failed
+        logger.error("All media download attempts exhausted", extra={
+            "media_id": media_id,
+            "total_attempts": max_retries + 1,
+            "final_error_type": type(last_exception).__name__,
+            "final_error": str(last_exception)
+        })
+        
+        raise last_exception
 
     async def mark_message_as_read(self, message_id: str) -> Dict[str, Any]:
         """

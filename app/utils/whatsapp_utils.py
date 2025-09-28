@@ -73,14 +73,33 @@ async def process_whatsapp_message(body):
                 media_data = await whatsapp_service.download_media(media_id)
                 logger.info("Media downloaded successfully", media_id=media_id, size=len(media_data) if media_data else 0)
             except Exception as e:
-                logger.error("Failed to download media", media_id=media_id, error=str(e))
-                # Send error message to user about media download failure
+                logger.error("Failed to download media after retries", media_id=media_id, error=str(e))
+                # Generate AI-powered error message and ask user to resend
                 try:
-                    error_message = "מצטער, לא הצלחתי להוריד את הקובץ. אנא נסה לשלוח שוב או פנה לצוות התמיכה."
-                    await whatsapp_service.send_text_message(wa_id, error_message)
+                    from ..services.ai_conversation_service import ai_conversation_service
+                    
+                    # Generate AI response for media download failure
+                    ai_error_response = await ai_conversation_service.generate_media_error_response(
+                        phone_number=wa_id,
+                        user_message=message_body,
+                        error_context={
+                            "error_type": "media_download_failed",
+                            "media_id": media_id,
+                            "original_message": message_body,
+                            "retry_attempts": 3
+                        }
+                    )
+                    
+                    await whatsapp_service.send_text_message(wa_id, ai_error_response)
                     return
                 except Exception as send_error:
-                    logger.error("Failed to send media download error message", error=str(send_error))
+                    logger.error("Failed to send AI-generated media download error message", error=str(send_error))
+                    # Fallback to simple message if AI fails
+                    try:
+                        fallback_message = "מצטער, לא הצלחתי להוריד את הקובץ. אנא נסה לשלוח שוב."
+                        await whatsapp_service.send_text_message(wa_id, fallback_message)
+                    except Exception as final_error:
+                        logger.error("Failed to send fallback error message", error=str(final_error))
 
         # Handle the message through conversation flow
         response_message = await conversation_flow_service.handle_incoming_message(
@@ -101,24 +120,47 @@ async def process_whatsapp_message(body):
                 return
             except Exception as send_error:
                 logger.error("Error sending WhatsApp message", wa_id=wa_id, error=str(send_error))
-                # Try to send error message
+                # Try to send AI-generated error message
                 try:
-                    error_message = "מצטער, אירעה שגיאה. אנא נסה שוב או פנה לצוות התמיכה."
-                    await whatsapp_service.send_text_message(wa_id, error_message)
+                    from ..services.ai_conversation_service import ai_conversation_service
+                    
+                    ai_error_response = await ai_conversation_service.generate_media_error_response(
+                        phone_number=wa_id,
+                        user_message=message_body,
+                        error_context={
+                            "error_type": "message_send_failed",
+                            "original_message": message_body,
+                            "retry_attempts": 0
+                        }
+                    )
+                    
+                    await whatsapp_service.send_text_message(wa_id, ai_error_response)
                 except Exception as final_error:
-                    logger.error("Failed to send error message", error=final_error)
+                    logger.error("Failed to send AI-generated error message", error=final_error)
 
     except Exception as e:
         logger.error("Error processing WhatsApp message", error=str(e))
-        # Send error message to user
+        # Send AI-generated error message to user
         try:
             wa_id = body["entry"][0]["changes"][0]["value"]["contacts"][0]["wa_id"]
-            error_message = "מצטער, אירעה שגיאה. אנא נסה שוב או פנה לצוות התמיכה."
-            await whatsapp_service.send_text_message(wa_id, error_message)
+            
+            from ..services.ai_conversation_service import ai_conversation_service
+            
+            ai_error_response = await ai_conversation_service.generate_media_error_response(
+                phone_number=wa_id,
+                user_message="message_processing_failed",
+                error_context={
+                    "error_type": "message_processing_failed",
+                    "original_message": "unknown",
+                    "retry_attempts": 0
+                }
+            )
+            
+            await whatsapp_service.send_text_message(wa_id, ai_error_response)
         except WhatsAppAPIError as api_error:
             logger.error("WhatsApp API error - cannot send error message", error=str(api_error))
         except Exception as send_error:
-            logger.error("Failed to send error message", error=send_error)
+            logger.error("Failed to send AI-generated error message", error=send_error)
 
 
 def is_valid_whatsapp_message(body):

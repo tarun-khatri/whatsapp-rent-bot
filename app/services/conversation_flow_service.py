@@ -158,7 +158,39 @@ class ConversationFlowService:
     async def _handle_greeting_state(self, phone: str, message_body: str, conversation_state: ConversationStateModel) -> str:
         """Handle greeting state - find tenant and send personalized greeting."""
         try:
-            # Find tenant by phone number
+            # Check if this is a lookup_required case (user already got manual lookup message)
+            if conversation_state.context_data.get("lookup_required"):
+                # User is responding to manual lookup request
+                logger.info("Handling manual lookup response", phone=phone, message=message_body)
+                
+                # Check if user provided meaningful information
+                if len(message_body.strip()) > 10:  # Has substantial content
+                    # User provided details - move to a waiting state or manual review
+                    await self._update_conversation_state(phone, ConversationState.GREETING, {
+                        "lookup_required": True,
+                        "user_details": message_body.strip(),
+                        "status": "manual_review_needed"
+                    })
+                    
+                    return """תודה על המידע שסיפקת. 
+
+אני מעביר את הפרטים לצוות שלנו לבדיקה ידנית
+
+נחזור אליך בהקדם האפשרי עם הפרטים הנכונים ונמשיך בתהליך ההרשמה
+
+תודה על הסבלנות! 😊"""
+                
+                else:
+                    # User didn't provide enough details
+                    return """אנא שלח פרטים מלאים יותר כדי שאוכל לעזור לך:
+
+• השם המלא שלך
+• מספר הטלפון
+• שם הנכס/הכתובת
+
+זה יעזור לי למצוא את הפרטים שלך במערכת 📋"""
+            
+            # Regular greeting flow - try to find tenant
             tenant = await supabase_service.find_tenant_by_phone(phone)
             
             if tenant:
@@ -191,12 +223,20 @@ class ConversationFlowService:
                 
                 return greeting_message
             else:
-                # Tenant not found - ask for manual lookup
-                await self._update_conversation_state(phone, ConversationState.GREETING, {"lookup_required": True})
+                # Tenant not found - ask for manual lookup (ONLY ONCE)
+                await self._update_conversation_state(phone, ConversationState.GREETING, {
+                    "lookup_required": True,
+                    "lookup_message_sent": True
+                })
                 
-                return """שלום! זה יוני ממגורית. לא מצאתי את הפרטים שלך במערכת.
+                return """שלום! זה יוני ממגורית 😊
 
-אנא שלח לי את השם המלא ומספר הטלפון שלך כדי שאוכל למצוא את הפרטים במערכת."""
+לא מצאתי את הפרטים שלך במערכת האוטומטית
+
+אנא שלח לי את הפרטים הבאים כדי שאוכל למצוא אותך במערכת:
+• השם המלא שלך
+• מספר הטלפון
+• שם הנכס או הכתובת"""
 
         except Exception as e:
             logger.error("Error handling greeting state", phone=phone, error=str(e))
@@ -388,14 +428,21 @@ class ConversationFlowService:
     async def _detect_document_type(self, media_data: bytes) -> DocumentType:
         """Detect document type using OCR and AI."""
         try:
-            # Use Document AI to extract text
+            # Use Document AI to extract text by processing as ID card first
             from app.services.document_ai_service import document_ai_service
-            document_result = await document_ai_service._extract_text_from_image(media_data)
+            from app.models.tenant import DocumentType
             
-            if not document_result or not document_result.text:
+            # Process the document to get text extraction
+            result = await document_ai_service.process_document(
+                file_data=media_data,
+                document_type=DocumentType.ID_CARD,  # Start with ID card as default
+                tenant_info={}  # Empty tenant info for detection
+            )
+            
+            if not result or not result.get("extracted_data", {}).get("text"):
                 return DocumentType.ID_CARD  # Default fallback
             
-            text = document_result.text
+            text = result["extracted_data"]["text"]
             
             # Use Vertex AI for intelligent document type detection
             from app.services.vertex_ai_service import vertex_ai_service
@@ -472,12 +519,9 @@ Return ONLY the document type (e.g., "PAYSLIPS" or "PNL").
     async def _process_document_upload(self, phone: str, media_data: bytes, document_type: DocumentType, tenant_id: str, conversation_state: ConversationStateModel) -> str:
         """Process uploaded document."""
         try:
-            # Detect document type if not specified
-            if document_type == DocumentType.ID_CARD:  # Default, try to detect
-                detected_type = await self._detect_document_type(media_data)
-                if detected_type != DocumentType.ID_CARD:
-                    document_type = detected_type
-                    logger.info("Document type detected", detected_type=detected_type.value)
+            # Don't auto-detect document type - use the expected document type from conversation state
+            # This prevents the bot from changing document types when user sends wrong document
+            logger.info("Processing document with expected type", expected_type=document_type.value)
             
             # Get tenant information
             tenant = await supabase_service.get_tenant_by_id(tenant_id)
@@ -518,36 +562,173 @@ Return ONLY the document type (e.g., "PAYSLIPS" or "PNL").
                 tenant = await supabase_service.get_tenant_by_id(tenant_id)
                 tenant_occupation = tenant.occupation if tenant else None
                 next_document = await self._get_next_document(document_type, tenant_occupation, conversation_state.context_data)
+                
+                # Create contextual success message
+                success_message = self._create_document_success_message(document_type, next_document, tenant)
+                
                 if next_document:
                     await self._update_conversation_state(phone, ConversationState.DOCUMENTS, {
                         **conversation_state.context_data,
                         "current_document": next_document.value
                     })
-                    return f"מעולה! {document_type.value} התקבל ואושר. {self._get_document_request_message(next_document.value)}"
+                    return success_message
                 else:
                     # All documents collected - move to guarantor
                     await self._update_conversation_state(phone, ConversationState.GUARANTOR_1, {
                         **conversation_state.context_data,
                         "current_guarantor": 1
                     })
-                    return "מעולה! כל המסמכים התקבלו ואושרו. עכשיו נצטרך מידע על הערבים.\n\nאנא שלח את השם ומספר הטלפון של הערב הראשון."
+                    return success_message
             else:
                 # Document rejected - provide specific feedback
                 errors = processing_result["validation_result"].get("errors", [])
                 warnings = processing_result["validation_result"].get("warnings", [])
                 
-                # Check for specific error types
-                if any("doesn't match expected" in error for error in errors):
-                    return f"תעודת הזהות לא אושרה כי השם במסמך לא תואם לשם שלך במערכת.\n\nאנא וודא ששלחת את התעודת הזהות הנכונה.\n\nאם זה השם הנכון, אנא פנה לצוות התמיכה."
-                elif any("ID number" in error for error in errors):
-                    return f"תעודת הזהות לא אושרה כי מספר הזהות לא תקין.\n\nאנא וודא שהתמונה ברורה ושלח שוב."
-                else:
-                    error_message = "המסמך לא אושר. " + " ".join(errors)
-                    return f"{error_message}\n\nאנא שלח שוב את {document_type.value}."
+                # Create contextual error message
+                error_message = self._create_document_error_message(document_type, errors, warnings)
+                return error_message
 
         except Exception as e:
             logger.error("Error processing document upload", phone=phone, document_type=document_type, error=str(e))
             return "מצטער, אירעה שגיאה בעיבוד המסמך. אנא נסה שוב."
+
+    def _create_document_success_message(self, document_type, next_document, tenant) -> str:
+        """Create contextual success message based on document type and next steps."""
+        try:
+            # Get document type in Hebrew
+            document_names = {
+                DocumentType.ID_CARD: "תעודת זהות",
+                DocumentType.PAYSLIPS: "תלושי שכר",
+                DocumentType.BANK_STATEMENTS: "העתקי בנק",
+                DocumentType.PNL: "דוח רווח והפסד",
+                DocumentType.SEPHACH: "טופס ספח"
+            }
+            
+            current_doc_name = document_names.get(document_type, document_type.value)
+            
+            if next_document:
+                next_doc_name = document_names.get(next_document, next_document.value)
+                
+                # Create contextual message based on what was just processed
+                if document_type == DocumentType.ID_CARD:
+                    return f"""✅ מעולה! {current_doc_name} התקבל ואושר בהצלחה!
+
+עכשיו אני צריך את {next_doc_name} שלך.
+
+{self._get_document_request_message(next_doc_name)}
+
+אם יש לך שאלות, אני כאן לעזור! 😊"""
+                
+                elif document_type == DocumentType.PAYSLIPS:
+                    return f"""✅ תלושי השכר התקבלו ואושרו!
+
+עכשיו אני צריך את {next_doc_name} שלך.
+
+{self._get_document_request_message(next_doc_name)}
+
+אנחנו כמעט בסיום! 🎉"""
+                
+                elif document_type == DocumentType.BANK_STATEMENTS:
+                    return f"""✅ העתקי הבנק התקבלו ואושרו!
+
+עכשיו אני צריך את {next_doc_name} שלך.
+
+{self._get_document_request_message(next_doc_name)}
+
+אנחנו כמעט בסיום! 🎉"""
+                
+                else:
+                    return f"""✅ {current_doc_name} התקבל ואושר!
+
+עכשיו אני צריך את {next_doc_name} שלך.
+
+{self._get_document_request_message(next_doc_name)}"""
+            
+            else:
+                # All documents collected
+                return f"""🎉 מעולה! כל המסמכים התקבלו ואושרו בהצלחה!
+
+עכשיו נצטרך מידע על הערבים שלך.
+
+**הערב הראשון:**
+אנא שלח את השם ומספר הטלפון של הערב הראשון.
+
+אנחנו כמעט בסיום התהליך! 🚀"""
+                
+        except Exception as e:
+            logger.error("Error creating document success message", error=str(e))
+            return f"מעולה! {document_type.value} התקבל ואושר."
+
+    def _create_document_error_message(self, document_type, errors, warnings) -> str:
+        """Create contextual error message based on document type and specific errors."""
+        try:
+            # Get document type in Hebrew
+            document_names = {
+                DocumentType.ID_CARD: "תעודת זהות",
+                DocumentType.PAYSLIPS: "תלושי שכר", 
+                DocumentType.BANK_STATEMENTS: "העתקי בנק",
+                DocumentType.PNL: "דוח רווח והפסד",
+                DocumentType.SEPHACH: "טופס ספח"
+            }
+            
+            doc_name = document_names.get(document_type, document_type.value)
+            
+            # Check for specific error types
+            if any("doesn't match expected" in error or "name mismatch" in error.lower() for error in errors):
+                return f"""❌ {doc_name} לא אושרה
+
+השם במסמך לא תואם לשם שלך במערכת.
+
+**מה לעשות:**
+• וודא ששלחת את {doc_name} הנכונה
+• אם זה השם הנכון, פנה לצוות התמיכה
+• נסה לצלם מחדש עם תאורה טובה
+
+אנא שלח שוב את {doc_name}."""
+            
+            elif any("ID number" in error for error in errors):
+                return f"""❌ {doc_name} לא אושרה
+
+מספר הזהות לא תקין או לא ברור.
+
+**מה לעשות:**
+• וודא שהתמונה ברורה וחדה
+• מספר הזהות חייב להיות קריא
+• נסה לצלם מחדש עם תאורה טובה
+• הימנע מברקים או צללים
+
+אנא שלח שוב את {doc_name}."""
+            
+            elif any("not found" in error for error in errors):
+                return f"""❌ {doc_name} לא אושרה
+
+לא הצלחתי לקרוא את המידע במסמך.
+
+**מה לעשות:**
+• וודא שהתמונה ברורה וחדה
+• כל הטקסט חייב להיות קריא
+• נסה לצלם מחדש עם תאורה טובה
+• הימנע מברקים או צללים
+
+אנא שלח שוב את {doc_name}."""
+            
+            else:
+                # Generic error with specific feedback
+                error_details = "\n".join([f"• {error}" for error in errors[:3]])  # Show first 3 errors
+                return f"""❌ {doc_name} לא אושרה
+
+{error_details}
+
+**מה לעשות:**
+• וודא שהתמונה ברורה וחדה
+• כל הטקסט חייב להיות קריא
+• נסה לצלם מחדש עם תאורה טובה
+
+אנא שלח שוב את {doc_name}."""
+                
+        except Exception as e:
+            logger.error("Error creating document error message", error=str(e))
+            return f"המסמך לא אושר. אנא שלח שוב את {document_type.value}."
 
     async def _get_next_document(self, current_document: DocumentType, tenant_occupation: str = None, conversation_context: Dict[str, Any] = None) -> Optional[DocumentType]:
         """Get the next document type in sequence based on occupation."""
@@ -889,16 +1070,24 @@ Return ONLY the JSON object."""
                 phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
             )
             
-            # Process using existing logic
+            # Use the enhanced greeting logic that prevents duplicate messages
             response = await self._handle_greeting_state(phone, message_body, conversation_state)
             
-            # Generate AI response
+            # Check if this is a manual lookup case - use the hardcoded response
+            if conversation_state.context_data.get("lookup_required"):
+                # For manual lookup cases, use the response directly (no AI modification needed)
+                return response
+            
+            # IMPORTANT: Get the UPDATED conversation state after processing greeting
+            updated_conversation_state = await self._get_or_create_conversation_state(phone)
+            
+            # For regular tenant greeting, generate AI response with UPDATED state
             ai_response = await ai_conversation_service.generate_response(
                 phone_number=phone,
                 user_message=message_body,
                 conversation_type="tenant",
-                current_state=conversation_state.current_state,
-                context_data=conversation_state.context_data
+                current_state=updated_conversation_state.current_state,
+                context_data=updated_conversation_state.context_data
             )
             
             return ai_response
@@ -921,13 +1110,22 @@ Return ONLY the JSON object."""
             # Process using existing logic
             response = await self._handle_confirmation_state(phone, message_body, conversation_state)
             
-            # Generate AI response
+            # IMPORTANT: Get the UPDATED conversation state after processing confirmation
+            updated_conversation_state = await self._get_or_create_conversation_state(phone)
+            
+            # Check if we moved to PERSONAL_INFO state - if so, don't generate AI response
+            # to avoid duplicate confirmation requests
+            if updated_conversation_state.current_state == ConversationState.PERSONAL_INFO:
+                # We've moved to personal info collection, use the direct response
+                return response
+            
+            # Generate AI response with UPDATED state only if we're still in CONFIRMATION
             ai_response = await ai_conversation_service.generate_response(
                 phone_number=phone,
                 user_message=message_body,
                 conversation_type="tenant",
-                current_state=conversation_state.current_state,
-                context_data=conversation_state.context_data
+                current_state=updated_conversation_state.current_state,
+                context_data=updated_conversation_state.context_data
             )
             
             return ai_response
@@ -940,24 +1138,178 @@ Return ONLY the JSON object."""
             return await self._handle_confirmation_state(phone, message_body, conversation_state)
 
     async def _handle_personal_info_state_with_ai(self, phone: str, message_body: str, conversation_state: ConversationStateModel) -> str:
-        """Handle personal info state with AI responses."""
+        """Handle personal info state with AI responses and proper business logic."""
         try:
+            current_field = conversation_state.context_data.get("current_field", "occupation")
+            tenant_id = conversation_state.context_data.get("tenant_id")
+            
+            logger.info("Processing personal info with AI", extra={
+                "phone": phone,
+                "current_field": current_field,
+                "message": message_body,
+                "tenant_id": tenant_id,
+                "conversation_state": conversation_state.current_state,
+                "context_data": conversation_state.context_data
+            })
+            
             # Store user message in history
             await ai_conversation_service._store_message_history(
                 phone, "tenant", "user_message", message_body, conversation_state.current_state, conversation_state.context_data
             )
             
-            # Process using existing logic
-            response = await self._handle_personal_info_state(phone, message_body, conversation_state)
+            # Check if this might be a confirmation response that got misrouted
+            # Look for confirmation words in the message
+            confirmation_words = ["yes", "yeah", "yep", "sure", "ok", "alright", "correct", "right", "perfect", 
+                                "sounds good", "that's correct", "i confirm", "confirmed", "agreed", "looks good",
+                                "כן", "נכון", "אישור", "בסדר", "טוב", "מושלם", "נשמע טוב", "זה נכון", "אני מאשר"]
             
-            # Generate AI response
+            message_lower = message_body.lower().strip()
+            is_confirmation_response = any(word in message_lower for word in confirmation_words)
+            
+            if is_confirmation_response and current_field == "occupation":
+                # This looks like a confirmation response that got misrouted to personal info
+                # Redirect back to asking for occupation properly
+                logger.info("Detected confirmation response in personal info state, redirecting to occupation question", extra={
+                    "phone": phone,
+                    "message": message_body,
+                    "current_field": current_field
+                })
+                
+                # Generate AI response asking for occupation
+                ai_response = await ai_conversation_service.generate_response(
+                    phone_number=phone,
+                    user_message=message_body,
+                    conversation_type="tenant",
+                    current_state=conversation_state.current_state,
+                    context_data=conversation_state.context_data
+                )
+                return ai_response
+            
+            # Use Vertex AI to validate and parse response
+            question = f"מה ה{current_field} שלך?"
+            if current_field == "number_of_children":
+                question = "כמה ילדים יש לך?"
+            elif current_field == "family_status":
+                question = "מה המצב המשפחתי שלך?"
+            elif current_field == "occupation":
+                question = "מה העיסוק שלך?"
+            
+            logger.info("Validating user response", extra={
+                "phone": phone,
+                "current_field": current_field,
+                "question": question,
+                "user_response": message_body
+            })
+            
+            validation_result = await vertex_ai_service.validate_human_response(
+                question,
+                message_body,
+                conversation_state.context_data
+            )
+            
+            if not validation_result.get("is_valid", False):
+                logger.warning("Invalid response from user", extra={
+                    "phone": phone,
+                    "message": message_body,
+                    "validation_result": validation_result
+                })
+                return validation_result.get("feedback", "אנא שלח תגובה תקינה.")
+            
+            parsed_data = validation_result.get("parsed_data", {})
+            
+            # Enhanced validation: make sure we have meaningful data
+            if not parsed_data or all(v is None for v in parsed_data.values()):
+                logger.warning("Validation returned empty parsed_data", extra={
+                    "phone": phone,
+                    "current_field": current_field,
+                    "validation_result": validation_result
+                })
+                
+                # Create fallback data based on current field
+                if current_field == "occupation":
+                    parsed_data = {"occupation": message_body.strip()}
+                elif current_field == "family_status":
+                    parsed_data = {"family_status": message_body.strip()}
+                elif current_field == "number_of_children":
+                    # Try to extract number
+                    import re
+                    numbers = re.findall(r'\d+', message_body)
+                    parsed_data = {"number_of_children": int(numbers[0]) if numbers else 0}
+                else:
+                    parsed_data = {"extracted_info": message_body.strip()}
+            
+            # Update tenant information based on current field
+            if tenant_id:
+                if current_field == "occupation":
+                    occupation_value = parsed_data.get("occupation", message_body)
+                    logger.info("Updating occupation", extra={
+                        "tenant_id": tenant_id,
+                        "occupation": occupation_value,
+                        "parsed_data": parsed_data
+                    })
+                    
+                    from app.models.tenant import TenantUpdate
+                    await supabase_service.update_tenant(tenant_id, TenantUpdate(occupation=occupation_value))
+                    await self._update_conversation_state(phone, ConversationState.PERSONAL_INFO, {
+                        **conversation_state.context_data,
+                        "current_field": "family_status"
+                    })
+                    
+                elif current_field == "family_status":
+                    family_status_value = parsed_data.get("family_status", message_body)
+                    logger.info("Updating family status", extra={
+                        "tenant_id": tenant_id,
+                        "family_status": family_status_value,
+                        "parsed_data": parsed_data
+                    })
+                    
+                    from app.models.tenant import TenantUpdate
+                    await supabase_service.update_tenant(tenant_id, TenantUpdate(family_status=family_status_value))
+                    await self._update_conversation_state(phone, ConversationState.PERSONAL_INFO, {
+                        **conversation_state.context_data,
+                        "current_field": "number_of_children"
+                    })
+                    
+                elif current_field == "number_of_children":
+                    number_of_children = parsed_data.get("number_of_children", 0)
+                    logger.info("Updating number of children", extra={
+                        "tenant_id": tenant_id,
+                        "number_of_children": number_of_children,
+                        "parsed_data": parsed_data
+                    })
+                    
+                    from app.models.tenant import TenantUpdate
+                    await supabase_service.update_tenant(tenant_id, TenantUpdate(number_of_children=number_of_children))
+                    
+                    # Get tenant occupation to determine document sequence
+                    tenant = await supabase_service.get_tenant_by_id(tenant_id)
+                    tenant_occupation = tenant.occupation if tenant else None
+                    
+                    # Move to documents state with ID_CARD as first document
+                    await self._update_conversation_state(phone, ConversationState.DOCUMENTS, {
+                        **conversation_state.context_data,
+                        "current_document": DocumentType.ID_CARD.value,
+                        "tenant_occupation": tenant_occupation
+                    })
+            
+            # Get updated conversation state for AI
+            updated_conversation_state = await self._get_or_create_conversation_state(phone)
+            
+            # Generate AI response with updated context
             ai_response = await ai_conversation_service.generate_response(
                 phone_number=phone,
                 user_message=message_body,
                 conversation_type="tenant",
-                current_state=conversation_state.current_state,
-                context_data=conversation_state.context_data
+                current_state=updated_conversation_state.current_state,
+                context_data=updated_conversation_state.context_data
             )
+            
+            logger.info("AI personal info response generated", extra={
+                "phone": phone,
+                "response_length": len(ai_response),
+                "new_state": updated_conversation_state.current_state,
+                "new_field": updated_conversation_state.context_data.get("current_field")
+            })
             
             return ai_response
             
@@ -979,7 +1331,19 @@ Return ONLY the JSON object."""
             # Process using existing logic
             response = await self._handle_documents_state(phone, message_body, message_type, media_data, conversation_state)
             
-            # Generate AI response
+            # Check if we have a specific contextual response (error messages, success messages)
+            # But allow AI responses for text messages when user is in documents state
+            if any(keyword in response for keyword in ["❌", "✅", "לא אושרה", "התקבל ואושר", "מעולה"]):
+                # Use the contextual response instead of generic AI
+                return response
+            
+            # For document request messages, only use hardcoded if it's a direct document request
+            # Allow AI to handle conversational responses
+            if "אנא שלח את" in response and message_type in ["image", "document"]:
+                # This is a direct document request for media upload
+                return response
+            
+            # Generate AI response only for generic cases
             ai_response = await ai_conversation_service.generate_response(
                 phone_number=phone,
                 user_message=message_body,
