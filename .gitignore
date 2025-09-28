@@ -90,5 +90,3 @@ target/
 # Exlcude the database file
 .db
 
-# Google Cloud Service Account credentials
-service-account.json

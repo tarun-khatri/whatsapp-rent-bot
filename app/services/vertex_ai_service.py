@@ -573,14 +573,18 @@ class VertexAIService:
             Formatted response with proper WhatsApp formatting
         """
         try:
+            import re
+            
             # Remove any unwanted AI artifacts
             response_text = response_text.replace("***", "*")  # Convert triple asterisks to single
             response_text = response_text.replace("בוט", "").replace("AI", "").replace("מערכת", "")
             
-            # Fix WhatsApp bold formatting - remove ** and replace with *text*
-            import re
-            # Replace **text** with *text* for WhatsApp bold
+            # Fix WhatsApp bold formatting - convert **text** to *text* for WhatsApp bold
             response_text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', response_text)
+            
+            # Remove any standalone asterisks that are not part of bold formatting
+            # This fixes the issue where * appears as literal text
+            response_text = re.sub(r'(?<!\*)\*(?!\*)(?![^*]*\*)', '', response_text)
             
             # Split into sentences and add line breaks
             sentences = re.split(r'[.!?]', response_text)
@@ -591,22 +595,18 @@ class VertexAIService:
                 if sentence:
                     formatted_sentences.append(sentence)
             
-            # Join sentences with double line breaks (gap after each sentence)
-            formatted_response = '\n\n'.join(formatted_sentences)
+            # Join sentences with single line breaks (not double)
+            formatted_response = '\n'.join(formatted_sentences)
             
             # Count and limit emojis to maximum 2
             emoji_pattern = re.compile(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U0001F700-\U0001F77F\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000027BF\U0001F004\U0001F0CF\U0001F170-\U0001F251]')
             emojis = emoji_pattern.findall(formatted_response)
             
-            if len(emojis) > 2:
-                # Remove excess emojis (keep first 2)
-                for emoji in emojis[2:]:
-                    formatted_response = formatted_response.replace(emoji, '', 1)
+            # Remove all emojis from the middle of the text
+            formatted_response = emoji_pattern.sub('', formatted_response)
             
-            # If no emojis, add one at the end
-            remaining_emojis = emoji_pattern.findall(formatted_response)
-            if not remaining_emojis:
-                formatted_response = formatted_response + " 😊"
+            # Add only one emoji at the very end
+            formatted_response = formatted_response.strip() + " 😊"
             
             logger.info("WhatsApp formatting applied", extra={
                 "original_length": len(response_text),
